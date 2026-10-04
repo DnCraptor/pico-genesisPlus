@@ -33,6 +33,10 @@ __license__ = "GPLv3"
 #include "gwenesis_savestate.h"
 #include "gwenesis_port.h"
 #include "gwsram.h"
+#include "scd.h"
+#if GENESIS_SEGACD
+#include "gwpier.h"
+#endif
 
 #if GNW_TARGET_MARIO !=0 || GNW_TARGET_ZELDA!=0
   #pragma GCC optimize("Ofast")
@@ -120,6 +124,10 @@ void load_cartridge(const unsigned char *buffer, size_t size)
     while (rom_addr_mask < size)
         rom_addr_mask <<= 1;
     rom_addr_mask -= 1;
+
+    /* Page table behind FETCH*ROM, back at its power-on banks. Must precede
+       set_region() below, which reads the header through it. */
+    gwmapper_reset(buffer, size, rom_addr_mask);
 
     /* TMSS latch survives from the previous game when relaunching without
        a reboot (PSRAM boards) — reset it here. */
@@ -381,12 +389,18 @@ static inline unsigned int gwenesis_bus_map_z80_address(unsigned int address) {
 static inline unsigned int gwenesis_bus_map_io_address(unsigned int address)
 {
   /* /TIME region $A13000-$A130FF, which carries the save RAM control register
-     at $A130F1. Upstream's "address & 0x1000" test sent $A13xxx to the Z80
+     at $A130F1 and the ROM bank registers at $A130F3-$FF. Upstream's "address & 0x1000" test sent $A13xxx to the Z80
      control registers, where it matched neither BUSREQ nor RESET and did
      nothing but a z80_sync(); reads returned z80_read_ctrl()'s 0xFF default,
      which the TIME_CTRL read case reproduces. */
   if ((address & 0xF000) == 0x3000)
     return TIME_CTRL;
+#if GENESIS_SEGACD
+  /* Sega CD: $A12000-$A120FF is the gate array (scd/cd/memory.c). Without a
+     CD session these addresses keep upstream's decode below. */
+  if ((address & 0xFF00) == 0x2000 && (gwcd_bus_mode & GWCD_BUS_SCD))
+    return MCD_CTRL;
+#endif
 
   unsigned int range = (address & 0x1000) ;
   switch (range) {
@@ -456,7 +470,17 @@ static inline unsigned int gwenesis_bus_read_memory_8(unsigned int address) {
     return gwsram_read8(address);
 
   case TIME_CTRL:
+#if GENESIS_SEGACD
+    /* Pier Solar's SPI EEPROM answers at $A1300B (port/gwpier.h). */
+    if (gwpier_active)
+      return gwpier_read8(address);
+#endif
     return 0xFF;
+
+#if GENESIS_SEGACD
+  case MCD_CTRL:
+    return gwcd_m68k_io_read8(address);
+#endif
 
   case RAM_ADDR:
     return FETCH8RAM(address);
@@ -510,6 +534,11 @@ static inline unsigned int gwenesis_bus_read_memory_16(unsigned int address) {
 
   case SRAM_ADDR:
     return gwsram_read16(address);
+
+#if GENESIS_SEGACD
+  case MCD_CTRL:
+    return gwcd_m68k_io_read16(address);
+#endif
 
   case IO_CTRL:
     return gwenesis_io_read_ctrl(address & 0x1F);
@@ -571,6 +600,20 @@ static inline void gwenesis_bus_write_memory_8(unsigned int address,
   case TIME_CTRL:
     gwsram_time_write(address, value);
     return;
+
+#if GENESIS_SEGACD
+  /* Writes below $800000: upstream dropped them all as ROM writes. A Sega
+     CD session has PRG-RAM and Word-RAM there, an MD+ session the MegaSD
+     registers; a plain cartridge still drops them. */
+  case ROM_ADDR:
+    if (gwcd_bus_mode != GWCD_BUS_CART)
+      gwcd_m68k_write8(address, value);
+    return;
+
+  case MCD_CTRL:
+    gwcd_m68k_io_write8(address, value);
+    return;
+#endif
 
   case IO_CTRL:
     gwenesis_io_write_ctrl(address & 0x1F, value);
@@ -640,6 +683,17 @@ static inline void gwenesis_bus_write_memory_16(unsigned int address,
     /* Byte register on an odd address; a word write puts it in the low half. */
     gwsram_time_write(address | 1, value & 0xFF);
     return;
+
+#if GENESIS_SEGACD
+  case ROM_ADDR:
+    if (gwcd_bus_mode != GWCD_BUS_CART)
+      gwcd_m68k_write16(address, value);
+    return;
+
+  case MCD_CTRL:
+    gwcd_m68k_io_write16(address, value);
+    return;
+#endif
 
   case Z80_RAM_ADDR:
   case Z80_RAM_ADDR1K:

@@ -28,6 +28,7 @@ __license__ = "GPLv3"
 #include "gwenesis_bus.h"
 #include "gwenesis_sn76489.h"
 #include "gwenesis_savestate.h"
+#include "scd.h"
 #include "gwenesis_port.h"
 
 #include <assert.h>
@@ -248,8 +249,21 @@ int gwenesis_vdp_vcounter()
  *  Process SEGA 315-5313 HVCOUNTER based on HCOUNTER and VCOUNTER
  *
  ******************************************************************************/
-//static inline __attribute__((always_inline))
-unsigned short gwenesis_vdp_hvcounter()
+/* PORT: interlace layout of the V byte (Sega manual, as in GPGX). Mode 2
+   counts the 448-line picture: V6..V0 then V7. Mode 1 shows V7..V1 then V8.
+   vcounter() leaves out bit 8 after the counter jump, which is exactly where
+   it stops returning scan_line. Out of line, and the counter itself is
+   forced inline below: with this added, GCC otherwise splits the counter
+   into flash, which would cost every game's HV counter reads a flash call. */
+static int __attribute__((noinline)) hvcounter_interlace_vc(int vc)
+{
+    if ((gwenesis_vdp_regs[12] & 6) == 6)
+        return (vc << 1) | ((vc >> 7) & 1);
+    return (vc & ~1) | ((vc >= 0x100) || (vc != scan_line));
+}
+
+static inline __attribute__((always_inline))
+unsigned short hvcounter_read(void)
 {
     /* H/V Counter */
     if (hvcounter_latched == 1)
@@ -260,8 +274,16 @@ unsigned short gwenesis_vdp_hvcounter()
     assert(vc < 512);
     assert(hc < 512);
 
+    if (gwenesis_vdp_regs[12] & 2)
+        vc = hvcounter_interlace_vc(vc);
+
     return ((vc & 0xFF) << 8) | (hc >> 1);
 
+}
+
+unsigned short gwenesis_vdp_hvcounter()
+{
+    return hvcounter_read();
 }
 
 //static inline __attribute__((always_inline))
@@ -308,7 +330,7 @@ static inline __attribute__((always_inline)) void gwenesis_vdp_register_w(int re
 
         if (REG0_HVLATCH && (hvcounter_latched == 0))
         {
-            hvcounter_latch = gwenesis_vdp_hvcounter();
+            hvcounter_latch = hvcounter_read();
             hvcounter_latched = 1;
            //printf("HVcounter latched:%x\n",hvcounter_latch);
         }
@@ -486,6 +508,59 @@ void gwenesis_vdp_dma_fill(unsigned short value)
 
 }
 
+#if GENESIS_SEGACD
+/* PORT: gwenesis_vdp_dma_m68k()'s 68000-space source loops for a Sega CD
+   session, reading through gwcd_dma_read16() (port/scd.c: Word-RAM one word
+   late, the cell image through its mapping). Kept out of line and in flash;
+   returns the source address after the transfer. */
+static unsigned int __attribute__((noinline)) dma_m68k_cd(unsigned int src_addr, int dma_length)
+{
+    unsigned int value;
+
+    switch (code_reg & 0xF) {
+
+    case 0x1: // dest is VRAM
+      do {
+        value = gwcd_dma_read16(src_addr);
+        push_fifo(value);
+        gwenesis_vdp_vram_write((address_reg)&0xFFFF, value >> 8);
+        gwenesis_vdp_vram_write((address_reg ^ 1) & 0xFFFF, value & 0xFF);
+        address_reg += REG15_DMA_INCREMENT;
+        src_addr += 2;
+      } while (--dma_length);
+      break;
+
+    case 0x3: // dest is CRAM
+      do {
+        value = gwcd_dma_read16(src_addr);
+        push_fifo(value);
+        CRAM[(address_reg & 0x7f) >> 1] = value;
+        unsigned short pixel = GWENESIS_CRAM_TO_PIXEL(value);
+        CRAM565[(address_reg & 0x7f) >> 1] = pixel;
+        CRAM565[0x40 + ((address_reg & 0x7f) >> 1)] = pixel;
+        CRAM565[0x80 + ((address_reg & 0x7f) >> 1)] = pixel;
+        CRAM565[0xC0 + ((address_reg & 0x7f) >> 1)] = pixel;
+        address_reg += REG15_DMA_INCREMENT;
+        src_addr += 2;
+      } while (--dma_length);
+      break;
+
+    case 0x5: // dest is VSRAM
+      do {
+        value = gwcd_dma_read16(src_addr);
+        push_fifo(value);
+        VSRAM[(address_reg & 0x7f) >> 1] = value & 0x03FF;
+        address_reg += REG15_DMA_INCREMENT;
+        src_addr += 2;
+      } while (--dma_length);
+      break;
+    default: // dest in unknown
+      break;
+    }
+    return src_addr;
+}
+#endif
+
 /******************************************************************************
  *
  *   SEGA 315-5313 DMA M68K
@@ -573,6 +648,15 @@ void gwenesis_vdp_dma_m68k()
 
     /* source is 68K ROM */
     } else {
+#if GENESIS_SEGACD
+      /* PORT: a Sega CD session reads Word-RAM a word late and the cell
+         image through its mapping; that copy of these loops lives in flash
+         (dma_m68k_cd above), so cartridge DMA keeps its plain fetch and this
+         SRAM-resident path only gains the test. */
+      if (gwcd_bus_mode & GWCD_BUS_SCD)
+        src_addr = dma_m68k_cd(src_addr, dma_length);
+      else
+#endif
 
      // unsigned int dma_source_address = (dma_source_high | dma_source_low) << 1; 
 
@@ -868,7 +952,10 @@ void gwenesis_vdp_write_data_port_16(unsigned int value)
         case 0x9: // VDP FIFO TEST
             break;
         default:
-            printf("VDP Data Port invalid");
+            /* The VDP drops writes with an invalid code. Not printed: The
+               Terminator (Sega CD) clears VRAM with code $1B, a game bug,
+               and floods the console (and the Pico's stdio) with it. */
+            vdpm_log(__FUNCTION__, "invalid code %02x", code_reg);
         }
 
     /* if a DMA is scheduled, do it */
@@ -929,7 +1016,7 @@ unsigned int GW_SRAM_FUNC(gwenesis_vdp_read_memory_16)(unsigned int address)
     else if (address < 0x8)
       return status_register_r();
     else if (address < 0xf)
-      return gwenesis_vdp_hvcounter();
+      return hvcounter_read();
     else 
       return 0xff;
 

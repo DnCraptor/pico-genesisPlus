@@ -94,7 +94,10 @@ enum mapped_address
     /* Port additions (append only, so upstream values do not shift):
        cartridge save RAM and the /TIME region that controls it. */
     SRAM_ADDR,
-    TIME_CTRL
+    TIME_CTRL,
+    /* Sega CD: the main CPU's gate array registers, $A12000-$A120FF, in a
+       CD session only (port/scd.h). */
+    MCD_CTRL
 };
 
 enum gwenesis_bus_pad_button
@@ -106,7 +109,12 @@ enum gwenesis_bus_pad_button
     PAD_B,
     PAD_C,
     PAD_A,
-    PAD_S
+    PAD_S,
+    /* 6-button pad only */
+    PAD_Z,
+    PAD_Y,
+    PAD_X,
+    PAD_M
 };
 
 #if GWENESIS_PICO != 0

@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <string.h>
+#include <malloc.h> /* printSramHeadroom */
+#include <unistd.h> /* sbrk; before the core headers, which #define uint */
 #include <algorithm>
 #include "pico/stdlib.h"
 #include "hardware/divider.h"
@@ -16,6 +18,10 @@
 #include "FrensFonts.h"
 #include "vumeter.h"
 #include "menu_settings.h"
+#if HSTX
+#include "romflash.h"
+#include "progress_bar.h"
+#endif
 #if PICO_RP2350 && PSRAM_CS_PIN
 #include "PicoPlusPsram.h"
 #endif
@@ -35,7 +41,14 @@ extern "C"
 #include "gwsnd.h"
 #include "buffers.h"
 #include "gwsram.h"
+#include "gwmapper.h"
+#include "scd.h"
+#include "gwpier.h"
 }
+#if GENESIS_SEGACD
+#include <malloc.h>
+#include "pico/mutex.h"
+#endif
 
 bool isFatalError = false;
 char *romName;
@@ -62,7 +75,12 @@ static int fpsStringLen = 2;
 static bool reset = false;
 static bool resetGame = false;
 
-extern "C" unsigned char button_state[3];
+extern "C" unsigned short button_state[3];
+static void updateButtonState();
+static void applyPadType();
+#if GENESIS_SEGACD
+static void saveCdBram();
+#endif
 
 static unsigned int drawFrame = 1;
 static int frame = 0;
@@ -131,6 +149,17 @@ static uint16_t wiipad_raw_cached = 0;
                                       // May cause artifacts on some screens, 336000 seems stable
                                       // https://github.com/PicoPlus-devel/retroJam/issues/7
 #define VOLTAGE VREG_VOLTAGE_1_50
+/* Optional overclock, as in pico_snesPlus: the "Run CPU at high clock"
+ * setting (Fruit Jam and Pico Plus 2 only) reboots into 504 MHz. 1.70 V is
+ * what 504 MHz needs to stay stable; 1.60-1.65 V runs but may hard-fault in
+ * heavy scenes. 504 / 4 is the same 126 MHz HSTX pixel clock, and
+ * pico_shared slows the flash interface to match. Off by default. */
+#define EMULATOR_MAX_CLOCKFREQ_KHZ 504000
+#define MAX_VOLTAGE VREG_VOLTAGE_1_70
+#define OVERCLOCK_SETTING (HW_CONFIG == 2 || HW_CONFIG == 8)
+#endif
+#ifndef OVERCLOCK_SETTING
+#define OVERCLOCK_SETTING 0
 #endif
 static uint32_t CPUFreqKHz = EMULATOR_CLOCKFREQ_KHZ;
 
@@ -163,7 +192,7 @@ const int8_t g_settings_visibility_md[MOPT_COUNT] = {
     [MOPT_AUTO_INSERT_FDS_DISK_A]    = 0,  // FDS (NES) only
     [MOPT_AUTO_SWAP_FDS_DISK]        = 0,  // FDS (NES) only
     [MOPT_FDS_DISK_SWAP]             = 0,  // FDS (NES) only
-    [MOPT_OVERCLOCK]                 = 0,  // Fixed clock, see setOverclockLimits() below
+    [MOPT_OVERCLOCK]                 = OVERCLOCK_SETTING, // 504 MHz, see EMULATOR_MAX_CLOCKFREQ_KHZ
     [MOPT_FM_AUDIO]                  = 0,  // SMS only
     [MOPT_ENTER_BOOTSEL_MODE]        = 1,
     [MOPT_CONTROLLER_TEST]           = 1,
@@ -174,6 +203,9 @@ const int8_t g_settings_visibility_md[MOPT_COUNT] = {
     [MOPT_SERIAL_KEYBOARD]           = 0,  // TI-99/4A only
     [MOPT_SPRITE_LIMIT]              = 0,  // NES only
     [MOPT_MENU_OVERSCAN]             = 0,  // Overscan in menu (menu.cpp force-shows this below the menu colors)
+    [MOPT_GENESIS_PAD]               = 1,  // 3 or 6 button pad
+    [MOPT_NES_PALETTE]               = 0,  // NES only
+    [MOPT_HSTX_CLOCK_FIX]            = HSTX && !CFG_TUH_RPI_PIO_USB, // Video Clock Fix; PIO-USB builds always have it (GENESIS_OVERCLOCK_HSTX_FIX)
 };
 
 const uint8_t g_available_screen_modes_md[] = {
@@ -282,8 +314,63 @@ extern "C" void gwsram_port_psram_free(void *p)
 #endif
 }
 
+#if GENESIS_SEGACD
+/* Pier Solar keeps its saves in a 64 KB SPI EEPROM (port/gwpier.h), not in
+   save RAM. Same .srm name, raw contents, the file PicoDrive writes. */
+static void loadPierEeprom()
+{
+    UINT got = 0;
+
+    buildSrmPath();
+    FRESULT fr = f_open(&srmFile, srmPath, FA_READ);
+    if (fr == FR_OK)
+    {
+        fr = f_read(&srmFile, gwpier_eeprom, GWPIER_EEPROM_SIZE, &got);
+        f_close(&srmFile);
+    }
+    if (fr == FR_OK && got)
+        printf("Cartridge EEPROM restored from %s\n", srmPath);
+    else
+        printf("No save file %s, cartridge EEPROM starts empty\n", srmPath);
+    gwpier_eeprom_dirty = 0;
+}
+
+static void savePierEeprom()
+{
+    UINT put = 0;
+
+    if (!gwpier_eeprom_dirty)
+        return;
+    buildSrmPath();
+    f_mkdir(GAMESAVEDIR);
+    FRESULT fr = f_open(&srmFile, srmPath, FA_CREATE_ALWAYS | FA_WRITE);
+    if (fr == FR_OK)
+    {
+        fr = f_write(&srmFile, gwpier_eeprom, GWPIER_EEPROM_SIZE, &put);
+        FRESULT closed = f_close(&srmFile);
+        if (fr == FR_OK)
+            fr = closed;
+    }
+    if (fr != FR_OK || put != GWPIER_EEPROM_SIZE)
+    {
+        snprintf(ErrorMessage, ERRORMESSAGESIZE, "Error writing save: %d", fr);
+        printf("%s (%s)\n", ErrorMessage, srmPath);
+        return; /* stays dirty: the next attempt tries again */
+    }
+    printf("Cartridge EEPROM saved to %s\n", srmPath);
+    gwpier_eeprom_dirty = 0;
+}
+#endif
+
 static void loadCartSram()
 {
+#if GENESIS_SEGACD
+    if (gwpier_active)
+    {
+        loadPierEeprom();
+        return;
+    }
+#endif
     if (!gwsram_span)
     {
         return;
@@ -349,6 +436,13 @@ static void loadCartSram()
 
 static void saveCartSram()
 {
+#if GENESIS_SEGACD
+    if (gwpier_active)
+    {
+        savePierEeprom();
+        return;
+    }
+#endif
     if (!gwsram_data || !gwsram_span)
     {
         return;
@@ -394,6 +488,13 @@ static void saveCartSram()
 
 int ProcessAfterFrameIsRendered()
 {
+#if GENESIS_SEGACD
+    /* Keep core1's CD-DA prefetch off the card while this touches it (see
+       gwcd_port_sd_lock). */
+    const bool cdLock = gwcd_bus_mode != GWCD_BUS_CART;
+    if (cdLock)
+        gwcd_port_sd_lock();
+#endif
     Frens::pollHeadPhoneJack();
 #if NES_PIN_CLK != -1
     nespad_read_start();
@@ -414,6 +515,7 @@ int ProcessAfterFrameIsRendered()
     // Poll Wii pad once per frame (function called once per rendered frame)
     wiipad_raw_cached = wiipad_read();
 #endif
+    updateButtonState();
 #if ENABLE_VU_METER
     if (isVUMeterToggleButtonPressed())
     {
@@ -428,6 +530,9 @@ int ProcessAfterFrameIsRendered()
         /* "Enter BOOTSEL" and "Return to loader" reboot from inside the menu
            and never come back, so flush the cartridge RAM on the way in. */
         saveCartSram();
+#if GENESIS_SEGACD
+        saveCdBram();
+#endif
         abSwapped = 1;
         int rval = showSettingsMenu(true);
         abSwapped = 0;
@@ -441,9 +546,14 @@ int ProcessAfterFrameIsRendered()
             resetGame = true;
         }
         audio_enabled = settings.flags.audioEnabled;
+        applyPadType(); // the Genesis pad setting may have changed
         // Reset next frame time for FPS limiter
         next_frame_time = 0;
     }
+#if GENESIS_SEGACD
+    if (cdLock)
+        gwcd_port_sd_unlock();
+#endif
     return count;
 }
 
@@ -452,6 +562,9 @@ static DWORD prevButtons[2]{};
 static int rapidFireMask[2]{};
 static int rapidFireCounter = 0;
 
+/* Button bits on the way from the pads to the core. The low byte uses the
+   menu's layout for SELECT, START and the d-pad, so the GPIO pads' word can be
+   masked straight into it; A B C X Y Z are the Genesis buttons. */
 static constexpr int LEFT = 1 << 6;
 static constexpr int RIGHT = 1 << 7;
 static constexpr int UP = 1 << 4;
@@ -461,6 +574,13 @@ static constexpr int START = 1 << 3;
 static constexpr int A = 1 << 0;
 static constexpr int B = 1 << 1;
 static constexpr int C = 1 << 8;
+static constexpr int X = 1 << 9;
+static constexpr int Y = 1 << 10;
+static constexpr int Z = 1 << 11;
+/* Button1 in the README (the menu's "back" button). It never reaches the core:
+   it keeps START + Button1 on the same physical button on every pad, whichever
+   Genesis button that is in a game. */
+static constexpr int HOT1 = 1 << 12;
 
 void toggleScreenMode()
 {
@@ -479,113 +599,154 @@ void toggleScreenMode()
 #endif
 }
 
-static inline int mapWiipadButtons(uint16_t buttonData)
-{
-    int mapped = 0;
-    // swap A and B buttons
-    if (buttonData & A)
-    {
-        mapped |= B;
-    }
-    if (buttonData & B)
-    {
-        mapped |= A;
-    }
-    if (buttonData & SELECT)
-    {
-        mapped |= SELECT;
-    }
-    if (buttonData & START)
-    {
-        mapped |= START;
-    }
-    if (buttonData & UP)
-    {
-        mapped |= UP;
-    }
-    if (buttonData & DOWN)
-    {
-        mapped |= DOWN;
-    }
-    if (buttonData & LEFT)
-    {
-        mapped |= LEFT;
-    }
-    if (buttonData & RIGHT)
-    {
-        mapped |= RIGHT;
-    }
-    if (buttonData & C)
-    {
-        mapped |= C;
-    }
-    return mapped;
-}
-
-/* Some pads have no third button at all: the vintage NES controller on the
-   GPIO port and the AliExpress Manta in NES mode. For those, SELECT doubles as
-   the Genesis C button while a game runs - the menu is unaffected, it reads the
-   pads through its own code and keeps SELECT for itself.
+/* SELECT doubles as a Genesis button on pads that are one short: as A on a
+   NES pad (it has only B and A, which play Genesis B and C), and as C on a GPIO
+   pad that has not identified itself (see nesPadButtons()). The menu is
+   unaffected, it reads the pads through its own code and keeps SELECT for
+   itself.
 
    The SELECT bit is deliberately left in place, so every in-game SELECT+...
-   hotkey keeps working. C is only withheld while START is held down, so
-   SELECT+START opens the settings menu without pressing C on its way out. */
-static inline int selectActsAsC(int bits)
+   hotkey keeps working. The button is only withheld while START is held down,
+   so SELECT+START opens the settings menu without pressing it on the way out. */
+static inline int selectDoublesAs(int bits, int button)
 {
-    return ((bits & SELECT) && !(bits & START)) ? (bits | C) : bits;
+    return ((bits & SELECT) && !(bits & START)) ? (bits | button) : bits;
+}
+
+/* In-game layout. Genesis pads are used as they are. Every other pad maps by
+   position, the way Genesis Plus GX does: the SNES layout's Y B A play Genesis
+   A B C and L X R play X Y Z, and the other pads follow from which of their
+   buttons sit where SNES Y B A X L R do (XInput X A B Y LB RB, PlayStation
+   Square Cross Circle Triangle L1 R1). NES pads have only B and A for Genesis
+   B and C, with SELECT as A. */
+
+/* Wii Classic and SNES Classic pads, wiipad_read() layout: bit0=A 1=B
+   2=Select 3=Start 4-7=d-pad 8=X 9=Y 10=L 11=R. */
+static inline int mapWiipadButtons(uint16_t w)
+{
+    int v = w & (SELECT | START | UP | DOWN | LEFT | RIGHT);
+    if (w & (1u << 9))
+        v |= A; // Y
+    if (w & (1u << 1))
+        v |= B | HOT1; // B
+    if (w & (1u << 0))
+        v |= C; // A
+    if (w & (1u << 10))
+        v |= X; // L
+    if (w & (1u << 8))
+        v |= Y; // X
+    if (w & (1u << 11))
+        v |= Z; // R
+    return v;
+}
+
+static inline bool isGenesisPad(const char *name)
+{
+    return name && (strncmp(name, "Genesis", 7) == 0 || strcmp(name, "MDArcade") == 0);
+}
+
+/* One USB pad or keyboard. hid_app.cpp reports the bottom face button as A,
+   the right one as B, the top one as X and the left one as Y; Genesis pads
+   report their own names. */
+static int mapUsbButtons(const io::GamePadState &gp)
+{
+    using Btn = io::GamePadState::Button;
+    const uint32_t b = gp.buttons;
+    const char *name = gp.GamePadName;
+    int v = (b & Btn::LEFT ? LEFT : 0) |
+            (b & Btn::RIGHT ? RIGHT : 0) |
+            (b & Btn::UP ? UP : 0) |
+            (b & Btn::DOWN ? DOWN : 0) |
+            (b & Btn::SELECT ? SELECT : 0) |
+            (b & Btn::START ? START : 0) |
+            (b & Btn::A ? HOT1 : 0) |
+            // Only Genesis pads, keyboard E and generic HID joysticks set these.
+            (b & Btn::C ? C : 0) |
+            (b & Btn::Z ? Z : 0);
+    if (isGenesisPad(name))
+    {
+        v |= (b & Btn::A ? A : 0) | (b & Btn::B ? B : 0) |
+             (b & Btn::X ? X : 0) | (b & Btn::Y ? Y : 0);
+    }
+    else if (name && strcmp(name, "Keyboard") == 0)
+    {
+        // Z X C = A B C and Q W E = X Y Z: keyboard rows, not pad positions.
+        v |= (b & Btn::A ? A : 0) | (b & Btn::B ? B : 0) | (b & Btn::X ? C : 0) |
+             (b & Btn::L ? X : 0) | (b & Btn::R ? Y : 0);
+    }
+    else if (name && strcmp(name, "Manta NES") == 0)
+    {
+        // AliExpress NES pad: A is NES B, B is NES A.
+        v |= (b & Btn::A ? B : 0) | (b & Btn::B ? C : 0);
+        v = selectDoublesAs(v, A);
+    }
+    else
+    {
+        v |= (b & Btn::Y ? A : 0) | (b & Btn::A ? B : 0) | (b & Btn::B ? C : 0) |
+             (b & Btn::L ? X : 0) | (b & Btn::X ? Y : 0) | (b & Btn::R ? Z : 0);
+    }
+    return v;
 }
 
 #if NES_PIN_CLK != -1
-/* One GPIO pad's buttons, with SELECT promoted to C.
+/* One GPIO pad.
 
-   Read through the full 12-button word, so both pad types reach the Genesis
-   buttons their labels promise, matching what the USB pads already do in
-   hid_app.cpp: the leftmost/bottom button is Genesis A and the one to the
-   right of it is Genesis B, i.e. NES B -> A, NES A -> B and SNES B -> A,
-   SNES A -> B, with SNES X on C. The pad shifts its buttons out in the order
-   bit0=B 1=Y 2=Select 3=Start 4=Up 5=Down 6=Left 7=Right 8=A 9=X 10=L 11=R on
-   a SNES pad, and bit0=A 1=B then the same Select/Start/dpad on a NES one.
-   Bits 2-7 therefore mean the same thing on both and already sit on the
-   constants above, so they pass straight through as a mask. SNES Y, L and R
-   have nowhere to go - the core is a 3-button pad.
+   The pad shifts its buttons out in the order bit0=B 1=Y 2=Select 3=Start
+   4=Up 5=Down 6=Left 7=Right 8=A 9=X 10=L 11=R on a SNES pad, and bit0=A 1=B
+   then the same Select/Start/d-pad on a NES one. Bits 2-7 therefore mean the
+   same thing on both and already sit on the constants above, so they pass
+   straight through as a mask.
 
    Bits 0 and 1 are the two that swap meaning, so they need to know which pad
    is on the wire. Only a NES pad can say so: it grounds the shift register's
    unused outputs, which the driver sees as the ID nibble on every single read,
-   so NESPAD_TYPE_NES is not a guess and needs no button press first. Anything
-   else is taken for a SNES pad, which is what an idle SNES pad and an active
-   8-bit-only adapter cable both need - the cost is that an aftermarket NES pad
-   that leaves those outputs floating cannot be recognised and loses B.
+   so NESPAD_TYPE_NES is not a guess and needs no button press first. It plays
+   NES B = Genesis B, NES A = C and SELECT = A.
 
-   SELECT still doubles as C for every pad on the port, SNES ones included -
-   see selectActsAsC() above. */
+   Anything else gets the SNES layout, which is what a SNES pad (idle or not)
+   and an 8-bit SNES->NES adapter cable both need. It also covers an
+   aftermarket NES pad that leaves those outputs floating and so cannot be
+   recognised: there bit0 is NES A and bit1 NES B, which the SNES layout
+   plays as Genesis B and A, and SELECT doubles as C, so all three buttons
+   stay in reach (#28, #34). */
 static inline int nesPadButtons(int pad)
 {
     const uint16_t ext = nespad_states_ext[pad];
+    const uint8_t type = nespad_padtype[pad];
     int v = ext & (SELECT | START | UP | DOWN | LEFT | RIGHT); // same bits on both pads
-    if (nespad_padtype[pad] == NESPAD_TYPE_NES)
+    if (type == NESPAD_TYPE_NES)
     {
-        if (ext & (1u << 0))
-            v |= B; // NES A
         if (ext & (1u << 1))
-            v |= A; // NES B
-    }
-    else
-    {
+            v |= B | HOT1; // NES B
         if (ext & (1u << 0))
-            v |= A; // SNES B
-        if (ext & (1u << 8))
-            v |= B; // SNES A
-        if (ext & (1u << 9))
-            v |= C; // SNES X
-        // bit1 is SNES Y - no fourth button to put it on.
+            v |= C; // NES A
+        return selectDoublesAs(v, A);
     }
-    return selectActsAsC(v);
+    // Button1 is whatever the menu treats as "back": B on a proven SNES pad,
+    // bit1 (NES B, or SNES Y on an idle SNES pad) until then.
+    if (ext & (1u << 1))
+        v |= A | (type == NESPAD_TYPE_SNES ? 0 : HOT1); // SNES Y
+    if (ext & (1u << 0))
+        v |= B | (type == NESPAD_TYPE_SNES ? HOT1 : 0); // SNES B
+    if (ext & (1u << 8))
+        v |= C; // SNES A
+    if (ext & (1u << 10))
+        v |= X; // SNES L
+    if (ext & (1u << 9))
+        v |= Y; // SNES X
+    if (ext & (1u << 11))
+        v |= Z; // SNES R
+    return selectDoublesAs(v, C);
 }
 #endif
 
-/* Core callback: refresh button_state[] (active low, S A C B R L D U). */
-extern "C" void gwenesis_io_get_buttons()
+/* Refresh button_state[] (active low, M X Y Z S A C B R L D U) and run the
+   in-game hotkeys. Called once per frame from ProcessAfterFrameIsRendered(),
+   right after the pads have been polled: none of the sources changes anywhere
+   else, so doing this on every pad read, as the core's callback would, only
+   costs time - and a 6-button game reads the port several times per frame.
+   It also keeps the hotkeys working while a game is not reading the pad. */
+static void updateButtonState()
 {
     char timebuf[10];
     bool usbConnected = false;
@@ -596,25 +757,7 @@ extern "C" void gwenesis_io_get_buttons()
         {
             usbConnected = gp.isConnected();
         }
-        int v = (gp.buttons & io::GamePadState::Button::LEFT ? LEFT : 0) |
-                (gp.buttons & io::GamePadState::Button::RIGHT ? RIGHT : 0) |
-                (gp.buttons & io::GamePadState::Button::UP ? UP : 0) |
-                (gp.buttons & io::GamePadState::Button::DOWN ? DOWN : 0) |
-                (gp.buttons & io::GamePadState::Button::A ? A : 0) |
-                (gp.buttons & io::GamePadState::Button::B ? B : 0) |
-                (gp.buttons & io::GamePadState::Button::X ? C : 0) | // X button maps to C button on non-genesis controllers
-                (gp.buttons & io::GamePadState::Button::C ? C : 0) |
-                (gp.buttons & io::GamePadState::Button::SELECT ? SELECT : 0) |
-                (gp.buttons & io::GamePadState::Button::START ? START : 0) |
-                0;
-
-        // The Manta reports as a NES pad in its NES mode, and then has no
-        // button that can reach C. Applied per source, so a pad with a real C
-        // sharing the same player slot keeps its own SELECT.
-        if (gp.GamePadName && strcmp(gp.GamePadName, "Manta NES") == 0)
-        {
-            v = selectActsAsC(v);
-        }
+        int v = mapUsbButtons(gp);
 
 #if NES_PIN_CLK != -1
         // When USB controller is connected both NES ports act as controller 2
@@ -702,7 +845,7 @@ extern "C" void gwenesis_io_get_buttons()
         if (p1 & START)
         {
             // Toggle frame rate display
-            if (pushed & A)
+            if (pushed & HOT1)
             {
                 settings.flags.displayFrameRate = !settings.flags.displayFrameRate;
                 printf("FPS: %s\n", settings.flags.displayFrameRate ? "ON" : "OFF");
@@ -723,16 +866,56 @@ extern "C" void gwenesis_io_get_buttons()
             }
         }
         prevButtons[i] = v;
-        button_state[i] = ((v & LEFT) ? 1 << PAD_LEFT : 0) |
-                          ((v & RIGHT) ? 1 << PAD_RIGHT : 0) |
-                          ((v & UP) ? 1 << PAD_UP : 0) |
-                          ((v & DOWN) ? 1 << PAD_DOWN : 0) |
-                          ((v & START) ? 1 << PAD_S : 0) |
-                          ((v & A) ? 1 << PAD_A : 0) |
-                          ((v & B) ? 1 << PAD_B : 0) |
-                          ((v & C) ? 1 << PAD_C : 0);
-        button_state[i] = ~button_state[i];
+        // Mode (PAD_M) is never pressed: the pads' MODE and SELECT buttons are
+        // the hotkey button, and hardly any game reads Mode.
+        button_state[i] = (unsigned short)~(((v & LEFT) ? 1 << PAD_LEFT : 0) |
+                                            ((v & RIGHT) ? 1 << PAD_RIGHT : 0) |
+                                            ((v & UP) ? 1 << PAD_UP : 0) |
+                                            ((v & DOWN) ? 1 << PAD_DOWN : 0) |
+                                            ((v & START) ? 1 << PAD_S : 0) |
+                                            ((v & A) ? 1 << PAD_A : 0) |
+                                            ((v & B) ? 1 << PAD_B : 0) |
+                                            ((v & C) ? 1 << PAD_C : 0) |
+                                            ((v & X) ? 1 << PAD_X : 0) |
+                                            ((v & Y) ? 1 << PAD_Y : 0) |
+                                            ((v & Z) ? 1 << PAD_Z : 0));
     }
+}
+
+/* Core callback, run on every pad read. button_state[] is already current:
+   updateButtonState() refreshes it once per frame. */
+extern "C" void gwenesis_io_get_buttons()
+{
+}
+
+/* Cartridge header, I/O support field ($190-$19F): '6' means the game knows
+   the 6-button pad. The rom sits byte-swapped for the core's 16-bit fetches
+   (see hdr8() in port/gwsram.c), hence the ^ 1. */
+static bool romListsSixButtonPad(const unsigned char *rom)
+{
+    for (uint32_t off = 0x190; off < 0x1A0; off++)
+    {
+        if (rom[off ^ 1] == '6')
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool romSixButton = false;
+
+/* Present 3- or 6-button pads per settings.flags.genesisPad: 0 = Auto (the
+   cartridge header decides), 1 = 3 button, 2 = 6 button. 3 buttons is the safe
+   choice for the rest: some 3-button games misread a 6-button pad, as they do
+   on real hardware. */
+static void applyPadType()
+{
+    bool six = settings.flags.genesisPad == 2 || (settings.flags.genesisPad == 0 && romSixButton);
+    gwenesis_io_set_six_button(0, six);
+    gwenesis_io_set_six_button(1, six);
+    printf("Pads: %d button (setting %d, header %s)\n", six ? 6 : 3,
+           settings.flags.genesisPad, romSixButton ? "lists 6 button" : "3 button");
 }
 
 /* ------------------------------------------------------------------ */
@@ -1112,6 +1295,26 @@ static void drawFpsOverlay()
     }
 }
 
+#if GENESIS_SEGACD
+/* The Sega CD part of the SELECT+DOWN perf line: where its time went since
+   the last call -- the sub CPU executing, skipped in wait loops, or halted,
+   and the main CPU skipped in wait loops. frames 0 only resets the counts.
+   Kept out of emulate(), which runs from SRAM. */
+static void __attribute__((noinline)) printCdStats(uint32_t frames, int is_pal)
+{
+    unsigned int sr, si, sh, mi;
+
+    gwcd_stats_take(&sr, &si, &sh, &mi);
+    if (!frames || !(gwcd_bus_mode & GWCD_BUS_SCD))
+        return;
+    uint64_t st = (uint64_t)sr + si + sh;
+    uint64_t mt = (uint64_t)frames * (is_pal ? 313u : 262u) * 3420u;
+    printf(", cd: sub run %u%% idle %u%% halted %u%%, main idle %u%%",
+           (unsigned)(st ? sr * 100ull / st : 0), (unsigned)(st ? si * 100ull / st : 0),
+           (unsigned)(st ? sh * 100ull / st : 0), (unsigned)(mi * 100ull / mt));
+}
+#endif
+
 void __not_in_flash_func(emulate)()
 {
     bool firstLoop = true;
@@ -1249,6 +1452,9 @@ void __not_in_flash_func(emulate)()
 #if GWSND_OFFLOAD
             printf(" bridge_drops=%u", gwsnd_stats_bridge_drops());
 #endif
+#if GENESIS_SEGACD
+            printCdStats(dbgFrames, is_pal);
+#endif
             printf("\n");
             dbgEmuSum = dbgEmuMax = dbgTotSum = dbgTotMax = dbgFrames = 0;
 #if HSTX
@@ -1262,6 +1468,9 @@ void __not_in_flash_func(emulate)()
             /* keep the accumulators fresh so enabling the toggle shows
                recent numbers, not an average since game start */
             dbgEmuSum = dbgEmuMax = dbgTotSum = dbgTotMax = dbgFrames = 0;
+#if GENESIS_SEGACD
+            printCdStats(0, is_pal);
+#endif
 #if HSTX
             dbgDiMin = UINT32_MAX;
             dbgDiMax = 0;
@@ -1412,6 +1621,599 @@ static bool isValidGenesisRom(uintptr_t addr, size_t size, char *err, size_t err
     return false;
 }
 
+/* ------------------------------------------------------------------ */
+/* ROMs too large for PSRAM (romflash.h).                               */
+/* ------------------------------------------------------------------ */
+
+/* PSRAM part of a ROM split between flash and PSRAM, or null, and how much of
+   the ROM the flash part holds. */
+static uint8_t *romTail = nullptr;
+static size_t romHeadLen = 0;
+
+/* HSTX boards with PSRAM only. The flash write takes XIP away for hundreds of
+   milliseconds at a time; HSTX scan-out on core1 is SRAM resident and rides
+   that out, PicoDVI's (pico_lib/dvi) runs from flash and does not. */
+#if HSTX
+
+/* A ROM-to-flash write ends in a reboot: an erase holds interrupts off for
+   hundreds of milliseconds at a time, which a PIO USB host does not survive.
+   This marker in watchdog scratch[5] picks the cart straight back up after
+   it, so the user still only chose it once. [4] is clobbered by
+   watchdog_reboot, [6]/[7] are the bootloader handshake (FrensHelpers.cpp),
+   which also means a bootloader build resumes into this emulator. */
+static constexpr int GEN_RESUME_SCRATCH = 5;
+static constexpr uint32_t GEN_RESUME_MAGIC = 0x6E5F1A54u;
+
+/* Decimal conversion for the flash status line, without pulling printf into
+   a callback that runs between flash operations. */
+static int u32ToDec(char *out, uint32_t v)
+{
+    char tmp[10];
+    int n = 0;
+    do
+    {
+        tmp[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    } while (v);
+    for (int i = 0; i < n; i++)
+        out[i] = tmp[n - 1 - i];
+    return n;
+}
+
+/* Progress bar during a ROM-to-flash write. Colours are RGB555 literals so
+   nothing is read from a palette in flash. The bar is built with
+   PROGRESS_BAR_IN_SRAM=0: romflash.cpp puts QMI M0 back to a working timing
+   inside every erase/program, so these calls always run against healthy
+   flash, and SRAM is better spent on the emulator. */
+#define PB_COL_BORDER 0x0000u /* black */
+#define PB_COL_EMPTY 0x7FFFu  /* white */
+#define PB_COL_FILL 0x03E0u   /* green */
+
+static void romflashProgress(int phase, uint32_t done, uint32_t total)
+{
+    /* Erase is the long pole, so give it most of the bar. */
+    uint32_t pct = total == 0 ? 0
+                   : (phase == ROMFLASH_ERASE)
+                       ? (uint32_t)((uint64_t)done * 60u / total)
+                       : 60u + (uint32_t)((uint64_t)done * 40u / total);
+
+    /* The write phase fires once per bounce buffer; redraw only on a move. */
+    static uint32_t last = 0xFFFFFFFFu;
+    if (pct == last && done != total)
+        return;
+    last = pct;
+
+    char st[32];
+    const char *what = (phase == ROMFLASH_ERASE) ? "Erasing " : "Writing ";
+    int n = 0;
+    while (what[n] && n < 12)
+    {
+        st[n] = what[n];
+        n++;
+    }
+    n += u32ToDec(st + n, done / 1024u);
+    st[n++] = '/';
+    n += u32ToDec(st + n, total / 1024u);
+    st[n++] = ' ';
+    st[n++] = 'K';
+    st[n++] = 'B';
+    st[n] = 0;
+    progress_bar_draw_status(st, PB_COL_EMPTY, PB_COL_BORDER);
+    progress_bar_draw(pct, 100, PB_COL_FILL, PB_COL_EMPTY, PB_COL_BORDER);
+}
+
+/* The menu hands back ROM_FILE_ADDR == 0 for a file too large to preload into
+   PSRAM. Run such a cart from the flash region instead, with whatever does not
+   fit there read into PSRAM. Writes the flash part first when the region does
+   not already hold this exact file, then reboots (see GEN_RESUME_SCRATCH).
+   Returns the image base, or 0 to go back to the menu -- with ErrorMessage set
+   unless the user simply declined the write. */
+static uintptr_t prepareOversizeRom(const char *path, size_t romSize, bool resumed)
+{
+    /* Anything the preload left there ("Cannot allocate ...") is not an error
+       here: running this cart from flash is the plan. */
+    ErrorMessage[0] = 0;
+
+    if (romflash_capacity() == 0)
+    {
+        snprintf(ErrorMessage, ERRORMESSAGESIZE, "ROM too large");
+        return 0;
+    }
+    size_t headLen = romflash_head_len(romSize);
+
+    /* On the launch we rebooted into, the record is proof of a write that was
+       verified moments ago: re-checking would only cost time, and under
+       ROMFLASH_FORCE_REWRITE it would rewrite and reboot forever. */
+    if (!resumed && !romflash_holds(path, romSize))
+    {
+        const char *shortName = Frens::GetfileNameFromFullPath((char *)path);
+        char sizeLine[40];
+        snprintf(sizeLine, sizeof(sizeLine), "%u KB - takes about a minute",
+                 (unsigned)(headLen / 1024));
+        if (!menuConfirmPrompt("This game is too big for RAM and",
+                               "must be written to flash first.", sizeLine))
+        {
+            printf("romflash: user declined the write\n");
+            return 0;
+        }
+        menuNoticeScreen("Writing to flash memory", shortName,
+                         "Do not power off.", "The console restarts when done.");
+        progress_bar_draw(0, 100, PB_COL_FILL, PB_COL_EMPTY, PB_COL_BORDER);
+        if (!romflash_program(path, romSize, romflashProgress))
+        {
+            snprintf(ErrorMessage, ERRORMESSAGESIZE, "Flash write failed");
+            return 0;
+        }
+        printf("romflash: rebooting to restore USB, then resuming\n");
+        watchdog_hw->scratch[GEN_RESUME_SCRATCH] = GEN_RESUME_MAGIC;
+        watchdog_reboot(0, 0, 0);
+        while (true)
+            tight_loop_contents();
+    }
+
+    const unsigned char *head = romflash_image();
+    if (headLen < romSize)
+    {
+        romTail = romflash_load_tail(path, romSize, headLen);
+        if (!romTail)
+        {
+            snprintf(ErrorMessage, ERRORMESSAGESIZE, "Not enough PSRAM for ROM");
+            return 0;
+        }
+        romHeadLen = headLen;
+    }
+    return (uintptr_t)head;
+}
+
+/* On a PSRAM board the rom browser lists only files that fit in free PSRAM.
+   With the flash region available, a ROM can be as large as the region's
+   whole banks plus a PSRAM tail (keeping the preload's 512 KB margin), so tell
+   the browser to list those too (maxOversizeRomSize, pico_shared). maxRomSize
+   only feeds the menu's status line on these boards; raise it to match. */
+static void raiseMaxRomSizeForFlash()
+{
+    if (!Frens::isPsramEnabled() || romflash_capacity() == 0)
+        return;
+    const size_t margin = 512 * 1024;
+    size_t avail = Frens::GetAvailableMemory();
+    size_t limit = romflash_head_len((size_t)-1) + (avail > margin ? avail - margin : 0);
+    if (limit < romflash_capacity())
+        limit = romflash_capacity();
+    printf("romflash: ROMs up to %u KB can run (flash region + %u KB PSRAM free)\n",
+           (unsigned)(limit / 1024), (unsigned)(avail / 1024));
+    maxOversizeRomSize = (int)limit;
+    if (limit > (size_t)maxRomSize)
+        maxRomSize = (int)limit;
+}
+#endif /* HSTX */
+
+extern char __StackLimit; /* end of the heap region (linker script) */
+
+/* What the SRAM heap can still hand out: the free space inside the arena plus
+   what sbrk has not claimed yet, up to __StackLimit. dumpHeapStats' "largest"
+   (keepcost) is only the arena's top free block, so on a PSRAM board, where
+   the arena grows on demand, it leaves out everything never claimed. Printed
+   once the sound engine is up, i.e. at the game's peak. */
+static void printSramHeadroom(const char *tag)
+{
+    struct mallinfo mi = mallinfo();
+    size_t unclaimed = (size_t)(&__StackLimit - (char *)sbrk(0));
+    printf("[heap] %-14s SRAM headroom=%uK (free in arena %uK + unclaimed %uK)\n", tag,
+           (unsigned)((mi.fordblks + unclaimed) >> 10), (unsigned)(mi.fordblks >> 10),
+           (unsigned)(unclaimed >> 10));
+}
+
+#if GENESIS_SEGACD
+/* ------------------------------------------------------------------ */
+/* Sega CD / Mega-CD and MD+ (port/scd.h)                              */
+/*                                                                     */
+/* A .cue or .chd picked in the rom browser is a Sega CD disc -- or,   */
+/* with a Mega Drive rom of the same name next to it, an MD+ game      */
+/* whose disc only holds its music. Either way the disc streams from   */
+/* the SD card; every CD buffer lives in PSRAM, so boards without      */
+/* PSRAM never offer these files.                                      */
+/* ------------------------------------------------------------------ */
+
+/* Platform hooks of port/scd.h. */
+extern "C" void *gwcd_port_psram_alloc(size_t size)
+{
+    void *p = gwsram_port_psram_alloc(size); /* non-panicking */
+    if (p)
+        memset(p, 0, size);
+    return p;
+}
+
+extern "C" void gwcd_port_psram_free(void *p)
+{
+    gwsram_port_psram_free(p);
+}
+
+/* FatFs is not reentrant, and on HSTX core1 prefetches CD audio while core0
+   reads data sectors. In a CD session every FatFs call holds this, core1's
+   only with a try (port/scd.h), and core0 holds it across its per-frame work
+   (ProcessAfterFrameIsRendered), where the in-game menu and the hotkeys that
+   save settings reach the card. Recursive: the backup RAM save nests inside
+   that. */
+static recursive_mutex_t cdSdMutex;
+
+extern "C" void gwcd_port_sd_lock(void)
+{
+    recursive_mutex_enter_blocking(&cdSdMutex);
+}
+
+extern "C" void gwcd_port_sd_unlock(void)
+{
+    recursive_mutex_exit(&cdSdMutex);
+}
+
+extern "C" int gwcd_port_sd_trylock(void)
+{
+    return recursive_mutex_try_enter(&cdSdMutex, nullptr) ? 1 : 0;
+}
+
+/* libchdr's decoders need 6-10 KB of stack; core0 has 3 KB, core1 4 KB, and
+   the SRAM heap cannot spare an 8 KB core1 stack the way pico-pcePlus does
+   it. So the call runs on a PSRAM stack: thread mode switches to the process
+   stack pointer (CONTROL.SPSEL) set to that memory for the duration of the
+   call, while interrupt handlers -- HSTX scan-out on core1 -- keep using the
+   main stack in SRAM. Only SPSEL is touched; the other CONTROL bits (FPCA
+   in particular) are left as the call leaves them. */
+static void __attribute__((naked, noinline)) runOnProcessStack(void *arg, void (*fn)(void *), void *top)
+{
+    __asm volatile(
+        "push {r4, lr}        \n"
+        "msr  psp, r2         \n"
+        "mrs  r4, control     \n"
+        "orr  r4, r4, #2      \n"
+        "msr  control, r4     \n"
+        "isb                  \n"
+        "blx  r1              \n"
+        "mrs  r4, control     \n"
+        "bic  r4, r4, #2      \n"
+        "msr  control, r4     \n"
+        "isb                  \n"
+        "pop  {r4, pc}        \n");
+}
+
+extern "C" void gwcd_port_big_stack_call(void (*fn)(void *), void *arg, void *stack, size_t size)
+{
+    if (!stack)
+    {
+        fn(arg);
+        return;
+    }
+    runOnProcessStack(arg, fn, (void *)(((uintptr_t)stack + size) & ~(uintptr_t)7));
+}
+
+/* Free space at the top of the SRAM heap, as port/gwsram.c judges it: by
+   the time the CD session starts every fixed emulator buffer is taken, so
+   the top-most free block is what is left. */
+extern "C" size_t gwcd_port_sram_free(void)
+{
+    struct mallinfo mi = mallinfo();
+    return (size_t)mi.keepcost;
+}
+
+/* A .cue or .chd; with m3u also an .m3u playlist of a multi-disc game. */
+static bool isDiscImage(const char *path, bool m3u = true)
+{
+    const char *dot = strrchr(path, '.');
+    return dot && (strcasecmp(dot, ".cue") == 0 || strcasecmp(dot, ".chd") == 0 ||
+                   (m3u && strcasecmp(dot, ".m3u") == 0));
+}
+
+/* Multi-disc games: while one runs, the settings menu's disk-swap entry
+   (pico_shared's FDS hooks) is "Change disc", listed first. The shared
+   visibility table is const, so for the session a copy with the entry
+   switched on (in PSRAM: the menu is no hot path) stands in for it. */
+static int8_t *cdDiscVisibility;
+
+static int cdDiscIndex() { return gwcd_disc_index(); }
+static int cdDiscCount() { return gwcd_disc_count(); }
+static void cdDiscChange(int disc) { gwcd_disc_change(disc); }
+static void cdDiscEject() {}
+static void cdDiscName(int disc, char *buf, int size) { snprintf(buf, size, "Disc %d", disc + 1); }
+
+static const MenuFdsHooks cdDiscHooks = {
+    cdDiscIndex, cdDiscCount, cdDiscChange, cdDiscEject, "Change disc", cdDiscName,
+};
+
+static void offerDiscChange(bool on)
+{
+    g_settings_visibility = g_settings_visibility_md;
+    menuSetFdsHooks(nullptr);
+    gwcd_port_psram_free(cdDiscVisibility);
+    cdDiscVisibility = nullptr;
+    if (on && (cdDiscVisibility = (int8_t *)gwcd_port_psram_alloc(MOPT_COUNT)) != nullptr)
+    {
+        memcpy(cdDiscVisibility, g_settings_visibility_md, MOPT_COUNT);
+        cdDiscVisibility[MOPT_FDS_DISK_SWAP] = 1;
+        g_settings_visibility = cdDiscVisibility;
+        menuSetFdsHooks(&cdDiscHooks);
+    }
+}
+
+/* The console's 8 KB backup RAM: one file per BIOS region, shared by every
+   game like the real thing, in the raw layout Genesis Plus GX and PicoDrive
+   write (scd_U.brm, scd_E.brm, scd_J.brm), so it moves to and from a PC. */
+static char brmPath[40];
+
+static void buildBrmPath()
+{
+    snprintf(brmPath, sizeof(brmPath), GAMESAVEDIR "/scd_%c.brm",
+             gwcd_bios_region() ? gwcd_bios_region() : 'U');
+}
+
+/* Both go through srmFile: a CD session has no cartridge RAM of its own. */
+static void loadCdBram()
+{
+    UINT got = 0;
+
+    buildBrmPath();
+    gwcd_port_sd_lock();
+    FRESULT fr = f_open(&srmFile, brmPath, FA_READ);
+    if (fr == FR_OK)
+    {
+        fr = f_read(&srmFile, gwcd_bram(), (UINT)gwcd_bram_size(), &got);
+        f_close(&srmFile);
+    }
+    gwcd_port_sd_unlock();
+    if (fr == FR_OK && got == gwcd_bram_size())
+        printf("Backup RAM restored from %s\n", brmPath);
+    else
+        printf("No backup RAM in %s, starting formatted\n", brmPath);
+    gwcd_bram_clean();
+}
+
+static void saveCdBram()
+{
+    UINT put = 0;
+
+    if (!(gwcd_bus_mode & GWCD_BUS_SCD) || !gwcd_bram() || !gwcd_bram_dirty())
+        return;
+    buildBrmPath();
+    gwcd_port_sd_lock();
+    f_mkdir(GAMESAVEDIR);
+    FRESULT fr = f_open(&srmFile, brmPath, FA_CREATE_ALWAYS | FA_WRITE);
+    if (fr == FR_OK)
+    {
+        fr = f_write(&srmFile, gwcd_bram(), (UINT)gwcd_bram_size(), &put);
+        FRESULT closed = f_close(&srmFile);
+        if (fr == FR_OK)
+            fr = closed;
+    }
+    gwcd_port_sd_unlock();
+    if (fr != FR_OK || put != gwcd_bram_size())
+    {
+        snprintf(ErrorMessage, ERRORMESSAGESIZE, "Error writing backup RAM: %d", fr);
+        printf("%s (%s)\n", ErrorMessage, brmPath);
+        return; /* stays dirty: the next attempt tries again */
+    }
+    printf("Backup RAM saved to %s\n", brmPath);
+    gwcd_bram_clean();
+}
+
+/* After the reboot that follows writing an MD+ cartridge to flash, the flash
+   record names the cartridge, not the disc it was picked through. The disc
+   is the one in the same folder whose MD+ pairing (gwcd_mdplus_rom_path) is
+   this cartridge; the rom browser hides such a cartridge, so the disc is
+   the only way it can have been started. */
+static bool findPairedDisc(const char *cartPath, char *out, size_t outSize)
+{
+    const size_t pairSize = FF_MAX_LFN + 8;
+    const char *slash = strrchr(cartPath, '/');
+    size_t dirLen = slash ? (size_t)(slash - cartPath) : 0;
+    DIR *dir = (DIR *)gwcd_port_psram_alloc(sizeof(DIR));
+    FILINFO *fno = (FILINFO *)gwcd_port_psram_alloc(sizeof(FILINFO));
+    char *pair = (char *)gwcd_port_psram_alloc(pairSize);
+    bool found = false;
+
+    if (slash && dir && fno && pair && dirLen + 2 < outSize)
+    {
+        memcpy(out, cartPath, dirLen);
+        out[dirLen] = 0;
+        if (f_opendir(dir, dirLen ? out : "/") == FR_OK)
+        {
+            while (!found && f_readdir(dir, fno) == FR_OK && fno->fname[0])
+            {
+                if ((fno->fattrib & AM_DIR) || !isDiscImage(fno->fname, false))
+                    continue;
+                snprintf(out + dirLen, outSize - dirLen, "/%s", fno->fname);
+                if (gwcd_disc_open(out) == 0)
+                {
+                    found = gwcd_mdplus_rom_path(out, pair, pairSize) && strcmp(pair, cartPath) == 0;
+                    gwcd_disc_close();
+                }
+            }
+            f_closedir(dir);
+        }
+    }
+    gwcd_port_psram_free(pair);
+    gwcd_port_psram_free(fno);
+    gwcd_port_psram_free(dir);
+    if (found)
+        printf("romflash: %s goes with %s\n", cartPath, out);
+    return found;
+}
+
+/* PSRAM a disc session needs beside its cartridge: the Sega CD's state
+   (1.1 MB), the CHD index and cache, the CD-DA ring, the MD+ page and the
+   Pier Solar buffers, with room to spare. */
+static constexpr size_t CD_SESSION_PSRAM = 3u * 1024 * 1024;
+
+/* One disc game, from the rom browser pick to the return to it.
+
+   Three kinds of session, chosen by what sits next to the disc:
+     - no cartridge: a Sega CD game, booted from the disc by the BIOS;
+     - a cartridge and a data-only music disc: MD+, the cartridge plays its
+       music from the disc through the MegaSD interface;
+     - a cartridge and a Sega CD disc: "Mode 1", the cartridge boots with the
+       Sega CD attached (Pier Solar's Enhanced Soundtrack Disc), MD+ included.
+   `resumed` is set on the launch that follows the reboot after a flash
+   write, as for any cartridge too large for PSRAM. */
+static void runDiscGame(char *selectedRom, bool resumed)
+{
+    const size_t pathSize = FF_MAX_LFN + 8;
+    char *cartPath = nullptr; /* the cartridge next to the disc (PSRAM) */
+    char *biosPath = nullptr; /* (PSRAM) */
+    const unsigned char *cart = nullptr;
+    uint8_t *cartInPsram = nullptr; /* to free, unless the cart runs from flash */
+    size_t cartSize = 0;
+    bool mdplus, scd;
+
+    /* The rom browser preloaded the (small) .cue into PSRAM; not needed. */
+    if (Frens::isPsramEnabled() && ROM_FILE_ADDR)
+    {
+        Frens::f_free((void *)ROM_FILE_ADDR);
+        ROM_FILE_ADDR = 0;
+    }
+    if (!Frens::isPsramEnabled())
+    {
+        snprintf(ErrorMessage, ERRORMESSAGESIZE, "Sega CD needs PSRAM");
+        return;
+    }
+    cartPath = (char *)gwcd_port_psram_alloc(pathSize);
+    biosPath = (char *)gwcd_port_psram_alloc(pathSize);
+    /* A .cue/.chd, or an .m3u: the disc set of a multi-disc game */
+    if (!cartPath || !biosPath || gwcd_disc_open_set(selectedRom) != 0)
+    {
+        snprintf(ErrorMessage, ERRORMESSAGESIZE, "Cannot read disc image");
+        goto out;
+    }
+
+    mdplus = gwcd_mdplus_rom_path(gwcd_disc_path(), cartPath, pathSize);
+    if (mdplus)
+    {
+        printf("MD+: cartridge %s\n", cartPath);
+        cartSize = getSelectedRomSize(cartPath);
+        if (cartSize + CD_SESSION_PSRAM <= Frens::GetAvailableMemory())
+        {
+            uint32_t crc = 0;
+            char *load = biosPath; /* the loader clears the path on error */
+            strcpy(load, cartPath);
+            cartInPsram = (uint8_t *)Frens::flashromtoPsram(load, true, crc, 0);
+            cart = cartInPsram;
+        }
+        else
+        {
+            /* Too large to share PSRAM with the disc: from the flash region,
+               the tail (if any) in PSRAM. May write the flash and reboot. */
+            cart = (const unsigned char *)prepareOversizeRom(cartPath, cartSize, resumed);
+            if (!cart)
+                goto out; /* declined, or ErrorMessage says why */
+        }
+        if (!cart || !isValidGenesisRom((uintptr_t)cart, cartSize, ErrorMessage, ERRORMESSAGESIZE))
+        {
+            if (!ErrorMessage[0])
+                snprintf(ErrorMessage, ERRORMESSAGESIZE, "MD+ rom could not be loaded");
+            goto out;
+        }
+        /* A Sega CD disc under a cartridge: Mode 1 when there is a BIOS for
+           the console the cartridge sets up. Without one it stays MD+. */
+        scd = gwcd_disc_region() &&
+              gwcd_bios_find(gwcd_disc_path(), gwcd_cart_region(cart, cartSize), "/bios", biosPath, pathSize);
+        /* The save file is the cartridge's, not the disc's. */
+        romName = cartPath;
+    }
+    else if (!gwcd_disc_region())
+    {
+        snprintf(ErrorMessage, ERRORMESSAGESIZE, "Not a Sega CD disc");
+        goto out;
+    }
+    else if (!gwcd_bios_find(gwcd_disc_path(), gwcd_disc_region(), "/bios", biosPath, pathSize))
+    {
+        snprintf(ErrorMessage, ERRORMESSAGESIZE, "No Sega CD BIOS in /bios/");
+        goto out;
+    }
+    else
+    {
+        scd = true;
+    }
+    offerDiscChange(scd && gwcd_disc_count() > 1);
+
+    do
+    {
+        abSwapped = 0;
+        reset = resetGame = false;
+        next_frame_time = 0;
+        if (mdplus)
+            gwmapper_set_storage(cart, romTail ? romHeadLen : cartSize, romTail);
+        gwsram_detect(mdplus ? cart : nullptr, mdplus ? cartSize : 0);
+        if (!init_emulator_mem())
+        {
+            snprintf(ErrorMessage, ERRORMESSAGESIZE, "Out of memory starting game");
+            break;
+        }
+        if (mdplus)
+            load_cartridge(cart, cartSize);
+        if (scd)
+        {
+            size_t biosSize = 0;
+            uint8_t *bios = gwcd_bios_load(biosPath, &biosSize);
+            int rc = bios ? gwcd_scd_start(bios, biosSize, mdplus ? cart : nullptr, mdplus ? cartSize : 0) : -1;
+            gwcd_port_psram_free(bios);
+            if (rc != 0)
+            {
+                snprintf(ErrorMessage, ERRORMESSAGESIZE, bios ? "Out of memory for Sega CD" : "Cannot read BIOS");
+                gwcd_stop();
+                free_emulator_mem();
+                break;
+            }
+        }
+        power_on();
+        reset_emulation();
+        if (scd)
+        {
+            gwcd_power_on();
+            loadCdBram();
+        }
+        if (mdplus)
+        {
+            if ((scd ? gwcd_mdplus_attach(cart, cartSize) : gwcd_mdplus_start(cart, cartSize)) != 0)
+            {
+                snprintf(ErrorMessage, ERRORMESSAGESIZE, "Out of memory for MD+");
+                gwcd_stop();
+                free_emulator_mem();
+                break;
+            }
+            romSixButton = romListsSixButtonPad(cart);
+            loadCartSram();
+        }
+        else
+        {
+            romSixButton = false;
+        }
+        applyPadType(); /* after reset_emulation(), which resets the pads to 3 buttons */
+        Frens::dumpHeapStats("cd game start");
+        startAudioSinks(); /* must precede gwsnd_init */
+        gwsnd_init(0 /* pal detected per frame */, HSTX);
+        printSramHeadroom("cd running");
+        emulate();
+        /* core1's CD-DA prefetch stops with the sound engine: after that
+           nothing else reads the card, and the session's buffers may go. */
+        gwsnd_shutdown();
+        if (mdplus)
+            saveCartSram();
+        saveCdBram();
+        gwcd_stop();
+        free_emulator_mem();
+    } while (resetGame);
+
+out:
+    offerDiscChange(false);
+    gwcd_disc_close();
+    if (cartInPsram)
+        Frens::f_free(cartInPsram);
+    romflash_free_tail(romTail);
+    romTail = nullptr;
+    romHeadLen = 0;
+    romName = selectedRom;
+    gwcd_port_psram_free(biosPath);
+    gwcd_port_psram_free(cartPath);
+    gwmapper_set_storage(nullptr, 0, nullptr);
+}
+#endif /* GENESIS_SEGACD */
+
 /// @brief
 /// Start emulator.
 /// @return
@@ -1423,9 +2225,22 @@ int main()
     char selectedRom[FF_MAX_LFN];
     romName = selectedRom;
     ErrorMessage[0] = selectedRom[0] = 0;
-    // This emulator is always overclocked at 378 Mhz or higher
-    Frens::setOverclockLimits(CPUFreqKHz,  CPUFreqKHz, VOLTAGE, VOLTAGE);
-    Frens::setClocksAndStartStdio(CPUFreqKHz, VOLTAGE);
+    // This emulator is always overclocked at 378 Mhz or higher. Where the
+    // overclock setting exists, the settings menu stores the chosen clock in
+    // FlashParams and reboots; pick it up here.
+    vreg_voltage voltage = VOLTAGE;
+#if OVERCLOCK_SETTING
+    Frens::setOverclockLimits(EMULATOR_CLOCKFREQ_KHZ, EMULATOR_MAX_CLOCKFREQ_KHZ, VOLTAGE, MAX_VOLTAGE);
+    const Frens::FlashParams *flashParams = (const Frens::FlashParams *)FLASHPARAM_ADDRESS;
+    if (Frens::validateFlashParams(*flashParams))
+    {
+        CPUFreqKHz = flashParams->cpuFreqKHz;
+        voltage = flashParams->voltage;
+    }
+#else
+    Frens::setOverclockLimits(CPUFreqKHz, CPUFreqKHz, VOLTAGE, VOLTAGE);
+#endif
+    Frens::setClocksAndStartStdio(CPUFreqKHz, voltage);
 
     printf("==========================================================================================\n");
     printf("Pico-Genesis+ %s\n", SWVERSION);
@@ -1444,15 +2259,69 @@ int main()
     scaleMode8_7_ = Frens::applyScreenMode(settings.screenMode);
 #endif
     bool showSplash = true;
+#if HSTX
+    raiseMaxRomSizeForFlash();
+    bool resumedFromFlashWrite = false;
+    if (watchdog_hw->scratch[GEN_RESUME_SCRATCH] == GEN_RESUME_MAGIC)
+    {
+        watchdog_hw->scratch[GEN_RESUME_SCRATCH] = 0;
+        /* The path comes from the flash record, never from ROMINFOFILE: that
+           file is written by every Frens emulator, so it routinely names
+           another console's cart. */
+        const char *rec = romflash_recorded_path();
+        if (rec && rec[0])
+        {
+            strncpy(selectedRom, rec, sizeof(selectedRom) - 1);
+            selectedRom[sizeof(selectedRom) - 1] = 0;
+            resumedFromFlashWrite = true;
+            showSplash = false;
+            printf("romflash: resuming %s after the flash write\n", selectedRom);
+        }
+        else
+        {
+            printf("romflash: resume asked for, but the record is invalid\n");
+        }
+    }
+#endif
     g_settings_visibility = g_settings_visibility_md;
     g_available_screen_modes = g_available_screen_modes_md;
     gwsnd_set_fill_query(sinkFillPermille);
+#if GENESIS_SEGACD
+    recursive_mutex_init(&cdSdMutex);
+    /* Discs (.cue, .m3u playlists of multi-disc games, and .chd when built
+       with CHD) only with PSRAM, where all their buffers live. */
+    const char *menuExts = Frens::isPsramEnabled() ? ".md .bin .cue .m3u" GWCD_CHD_EXT : ".md .bin";
+#else
+    const char *menuExts = ".md .bin";
+#endif
     while (true)
     {
         if (strlen(selectedRom) == 0 || reset == true)
         {
-            menu("Pico-Genesis+", ErrorMessage, isFatalError, showSplash, ".md .bin", selectedRom);
+            menu("Pico-Genesis+", ErrorMessage, isFatalError, showSplash, menuExts, selectedRom);
         }
+#if GENESIS_SEGACD
+        if (resumedFromFlashWrite && Frens::isPsramEnabled() && !isDiscImage(selectedRom))
+        {
+            /* The flash write was for an MD+ cartridge: back to its disc. */
+            char *disc = (char *)gwcd_port_psram_alloc(FF_MAX_LFN);
+            if (disc && findPairedDisc(selectedRom, disc, FF_MAX_LFN))
+                strcpy(selectedRom, disc);
+            gwcd_port_psram_free(disc);
+        }
+        if (isDiscImage(selectedRom))
+        {
+            printf("Now playing (disc): %s\n", selectedRom);
+            audio_enabled = settings.flags.audioEnabled;
+            runDiscGame(selectedRom, resumedFromFlashWrite);
+            resumedFromFlashWrite = false;
+            if (ErrorMessage[0])
+                printf("%s\n", ErrorMessage);
+            selectedRom[0] = 0;
+            showSplash = false;
+            continue;
+        }
+#endif
 #if !HSTX
         if (settings.screenMode != ScreenMode::SCANLINE_1_1 && settings.screenMode != ScreenMode::NOSCANLINE_1_1)
         {
@@ -1465,22 +2334,45 @@ int main()
         audio_enabled = settings.flags.audioEnabled;
         size_t romSize = getSelectedRomSize(selectedRom);
 
+        /* Normally the menu has preloaded the ROM into PSRAM (or, without
+           PSRAM, flashed it). Zero with PSRAM present means it was too large
+           to preload: run it from the flash region. */
+        uintptr_t romAddr = ROM_FILE_ADDR;
+#if HSTX
+        if (!romAddr && Frens::isPsramEnabled() && strlen(selectedRom) > 0)
+        {
+            romAddr = prepareOversizeRom(selectedRom, romSize, resumedFromFlashWrite);
+            if (!romAddr)
+            {
+                resumedFromFlashWrite = false;
+                selectedRom[0] = 0;
+                showSplash = false;
+                continue;
+            }
+        }
+        resumedFromFlashWrite = false;
+#endif
+        /* Every game, split or not: the firmware never reboots between games,
+           and a previous game's split must not survive into this one. */
+        gwmapper_set_storage((const unsigned char *)romAddr,
+                             romTail ? romHeadLen : romSize, romTail);
+
         do
         {
             abSwapped = 0; // don't swap A and B buttons
             reset = resetGame = false;
             next_frame_time = 0; // Reset next frame time for FPS limiter
-            if (!isValidGenesisRom(ROM_FILE_ADDR, romSize, ErrorMessage, ERRORMESSAGESIZE))
+            if (!isValidGenesisRom(romAddr, romSize, ErrorMessage, ERRORMESSAGESIZE))
             {
                 printf("%s: %s\n", ErrorMessage, selectedRom);
                 reset = true;
                 break;
             }
             printf("Starting game (%d KB rom) rom@%p\n", (int)(romSize / 1024),
-                   (void *)ROM_FILE_ADDR);
+                   (void *)romAddr);
             /* Must precede init_emulator_mem(), which allocates the buffer
                this sizes. */
-            gwsram_detect((const unsigned char *)ROM_FILE_ADDR, romSize);
+            gwsram_detect((const unsigned char *)romAddr, romSize);
             if (!init_emulator_mem())
             {
                 snprintf(ErrorMessage, 40, "Out of memory starting game");
@@ -1488,13 +2380,16 @@ int main()
                 reset = true;
                 break;
             }
-            load_cartridge((const unsigned char *)ROM_FILE_ADDR, romSize);
+            load_cartridge((const unsigned char *)romAddr, romSize);
             power_on();
             reset_emulation();
+            romSixButton = romListsSixButtonPad((const unsigned char *)romAddr);
+            applyPadType(); /* after reset_emulation(), which resets the pads to 3 buttons */
             loadCartSram();
             Frens::dumpHeapStats("game start"); /* peak usage, both heaps */
             startAudioSinks();                  /* must precede gwsnd_init */
             gwsnd_init(0 /* pal detected per frame */, HSTX);
+            printSramHeadroom("game running");
             emulate();
             /* Covers both leaving the game and resetting it: the loop below
                re-enters and reloads the file. */
@@ -1516,6 +2411,14 @@ int main()
             Frens::f_free((void *)ROM_FILE_ADDR);
             ROM_FILE_ADDR = 0;
         }
+        /* The PSRAM half of a flash/PSRAM split, for the same reason. The
+           flash half is never freed. */
+#if HSTX
+        romflash_free_tail(romTail);
+#endif
+        romTail = nullptr;
+        romHeadLen = 0;
+        gwmapper_set_storage(nullptr, 0, nullptr);
         selectedRom[0] = 0;
         showSplash = false;
     }
