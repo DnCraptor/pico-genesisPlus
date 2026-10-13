@@ -1,5 +1,7 @@
 # CHANGELOG
 
+**Unreleased** adds the Waveshare RP2350-PiZero (z0p2) build, `./bld.sh -c16`: PicoDVI video on GPIO32–39, I2S audio module, USB keyboard on the main USB-C port, NES pad on GPIO4/5/7, SD card on SPI1.
+
 **v0.19** changes the button layout in games for controllers other than Genesis ones.
 
 

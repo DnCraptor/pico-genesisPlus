@@ -54,6 +54,7 @@ Wiring depends on the board. The hardware is the same as for the NES emulator, s
 | Pimoroni Pico Plus 2, wired the same as the Pico 2 above | [Adafruit hardware and breadboard](https://github.com/PicoPlus-devel/pico-infonesPlus/blob/main/README.md#raspberry-pi-pico-or-pico-2-setup-with-adafruit-hardware-and-breadboard), [PicoNES PCB](#picones-pcb) (needs v2.6 with male headers) |
 | PicoNES, PicoNES Mini or PicoNES Micro PCB | [Custom PCBs](#custom-pcbs) |
 | Olimex RP2040-PICO-PC with a Pico 2 | [Olimex RP2040-PICO-PC](#olimex-rp2040-pico-pc) |
+| Waveshare RP2350-PiZero (z0p2) | [Waveshare RP2350-PiZero](#waveshare-rp2350-pizero-z0p2) |
 
 
 
@@ -71,6 +72,7 @@ Ready-made `.uf2` files for all of these are on the [releases page](https://gith
 | Adafruit Metro RP2350 | HSTX, 60 Hz | `./bld.sh -c5` | `picogenesisPlus_AdafruitMetroRP2350_arm.uf2` |
 | Murmulator M2 — *untested* | HSTX, 60 Hz | `./bld.sh -c13` | `picogenesisPlus_MurmulatorM2_arm.uf2` |
 | [Olimex RP2040-PICO-PC](#olimex-rp2040-pico-pc) with a Pico 2 | HSTX, 60 Hz | `./bld.sh -c15` | `picogenesisPlus_OlimexPicoPC_arm.uf2` |
+| [Waveshare RP2350-PiZero](#waveshare-rp2350-pizero-z0p2) (z0p2) with an I2S audio module | PicoDVI, 60 Hz, 252 MHz | `./bld.sh -c16` | `picogenesisPlus_WaveShareRP2350PiZero_z0p2_I2S_arm.uf2` |
 | Pimoroni [Pico DV Demo Base](https://shop.pimoroni.com/products/pimoroni-pico-dv-demo-base?variant=39494203998291) | PicoDVI, 77.1 Hz, runs slower | `./bld.sh -c1 -2` | `picogenesisPlus_PimoroniDVI_pico2_arm.uf2` |
 | Waveshare RP2350-Zero on the [PicoNES Mini PCB](#picones-mini-pcb) | PicoDVI, 77.1 Hz, runs slower | `./bld.sh -c6 -2` | `picogenesisPlus_WaveShareRP2350ZeroWithPCB_arm.uf2` |
 | Waveshare RP2350-USB-A, on its own or on the [PicoNES Micro PCB](#picones-micro-pcb) | PicoDVI, 77.1 Hz, runs slower | `./bld.sh -c9` | `picogenesisPlus_WaveShare2350USBA_arm_piousb.uf2` |
@@ -138,6 +140,16 @@ Most games are 4 MB or smaller. A few are larger and switch between parts of the
 - **Larger than 8 MB**, the game does not fit in PSRAM. On a board with HSTX video, PSRAM and 16 MB of flash, such as the Adafruit Fruit Jam or a Pimoroni Pico Plus 2 in the `-c2` build, it runs from flash instead, with the part that does not fit there held in PSRAM. The limit is about 15 MB. Boards that use the PicoDVI driver do not support this.
 
 The first time such a game is started, the console asks before it writes the game to flash. Writing takes about a minute, a progress bar shows how far it is, and the console restarts and starts the game when it is done. Do not switch the board off while it is writing. After that the game starts in a few seconds, until another game of that size is started and takes its place. [pico-snesPlus](https://github.com/PicoPlus-devel/pico-snesPlus) uses the same part of the flash for its largest games, so starting one of those replaces it as well.
+
+### Waveshare RP2350-PiZero (z0p2)
+
+The [Waveshare RP2350-PiZero](https://www.waveshare.com/) is an RP2350B board with 16 MB flash and a mini-HDMI connector. The build is `./bld.sh -c16` (`HW_CONFIG` 16) and runs at 252 MHz; it does not overclock.
+
+- **Video:** mini-HDMI through PicoDVI on GPIO32–39 (red 32/33, green 34/35, blue 36/37, clock 38/39). HSTX is not used on this board.
+- **Sound:** a PCM5102A I2S module on GPIO10 (DIN), GPIO11 (BCK) and GPIO12 (LRCK).
+- **Keyboard:** a USB keyboard on the main USB-C connector through an OTG adapter. Power comes from the second USB-C connector (the one marked PIO-USB), which is not used for input.
+- **NES pad:** CLK GPIO4, LATCH GPIO5, DATA GPIO7. Only one pad is supported on this board.
+- **SD card:** SPI1 on SCK GPIO30, MOSI GPIO31, MISO GPIO40, CS GPIO43.
 
 ### Olimex RP2040-PICO-PC
 
