@@ -16,7 +16,7 @@ Based on [Gwenesis](https://github.com/bzhxx/gwenesis) by bzhxx, with the Sega C
 **Picture and sound**
 - 60 Hz HDMI output with sound on boards with HSTX video. Other boards use the PicoDVI driver at 77.1 Hz, and games run slower there. See [Supported boards](#supported-boards).
 - Screen modes with and without scanlines, [frame skip](#frame-skip) and a framerate display.
-- On the Fruit Jam, sound also through the built-in speaker and the headphone jack, with volume control and a VU meter on the board's LEDs. On the Pimoroni Pico DV Demo Base and the Murmulator M1, sound through the line-out jack.
+- On the Fruit Jam, sound also through the built-in speaker and the headphone jack, with volume control and a VU meter on the board's LEDs. On the Pimoroni Pico DV Demo Base and the Murmulator M1, sound through the line-out jack. On the Olimex RP2040-PICO-PC, sound also through the audio jack.
 
 **Controllers**
 - USB controllers (Dual Shock/Dual Sense, PSClassic, XInput, Genesis Mini 1 and 2, Retro-Bit Arcade Pad, NES and SNES style pads), NES and SNES controllers on the GPIO port, SNES Classic and Wii Classic Pro controllers on the Fruit Jam, and a USB keyboard. See [Controllers and buttons](#controllers-and-buttons).
@@ -53,6 +53,7 @@ Wiring depends on the board. The hardware is the same as for the NES emulator, s
 | Pimoroni Pico DV Demo Base | [Pimoroni Pico DV Demo Base](https://github.com/PicoPlus-devel/pico-infonesPlus/blob/main/README.md#raspberry-pi-pico-or-pico-2-setup-for-pimoroni-pico-dv-demo-base) |
 | Pimoroni Pico Plus 2, wired the same as the Pico 2 above | [Adafruit hardware and breadboard](https://github.com/PicoPlus-devel/pico-infonesPlus/blob/main/README.md#raspberry-pi-pico-or-pico-2-setup-with-adafruit-hardware-and-breadboard), [PicoNES PCB](#picones-pcb) (needs v2.6 with male headers) |
 | PicoNES, PicoNES Mini or PicoNES Micro PCB | [Custom PCBs](#custom-pcbs) |
+| Olimex RP2040-PICO-PC with a Pico 2 | [Olimex RP2040-PICO-PC](#olimex-rp2040-pico-pc) |
 
 
 
@@ -69,13 +70,14 @@ Ready-made `.uf2` files for all of these are on the [releases page](https://gith
 | Same, but with a Pico 2 W — *untested* | HSTX, 60 Hz | `./bld.sh -c2 -2 -w` | `picogenesisPlus_AdafruitDVISD_pico2_w_arm.uf2` |
 | Adafruit Metro RP2350 | HSTX, 60 Hz | `./bld.sh -c5` | `picogenesisPlus_AdafruitMetroRP2350_arm.uf2` |
 | Murmulator M2 — *untested* | HSTX, 60 Hz | `./bld.sh -c13` | `picogenesisPlus_MurmulatorM2_arm.uf2` |
+| [Olimex RP2040-PICO-PC](#olimex-rp2040-pico-pc) with a Pico 2 | HSTX, 60 Hz | `./bld.sh -c15` | `picogenesisPlus_OlimexPicoPC_arm.uf2` |
 | Pimoroni [Pico DV Demo Base](https://shop.pimoroni.com/products/pimoroni-pico-dv-demo-base?variant=39494203998291) | PicoDVI, 77.1 Hz, runs slower | `./bld.sh -c1 -2` | `picogenesisPlus_PimoroniDVI_pico2_arm.uf2` |
 | Waveshare RP2350-Zero on the [PicoNES Mini PCB](#picones-mini-pcb) | PicoDVI, 77.1 Hz, runs slower | `./bld.sh -c6 -2` | `picogenesisPlus_WaveShareRP2350ZeroWithPCB_arm.uf2` |
 | Waveshare RP2350-USB-A, on its own or on the [PicoNES Micro PCB](#picones-micro-pcb) | PicoDVI, 77.1 Hz, runs slower | `./bld.sh -c9` | `picogenesisPlus_WaveShare2350USBA_arm_piousb.uf2` |
 | [Spotpear HDMI board](https://spotpear.com/index/product/detail/id/1207.html) — *untested* | PicoDVI, 77.1 Hz, runs slower | `./bld.sh -c10 -2` | `picogenesisPlus_SpotpearHDMI_pico2_arm.uf2` |
 | Murmulator M1 — *untested* | PicoDVI, 77.1 Hz, runs slower | `./bld.sh -c12 -2` | `picogenesisPlus_MurmulatorM1_pico2_arm.uf2` |
 
-Boards marked *untested* build and are released, but have not been tried on real hardware. They also have no setup section in the table above: wire the Spotpear board according to [its own documentation](https://spotpear.com/index/product/detail/id/1207.html), and for the Murmulator boards see [murmulator.ru](https://murmulator.ru/) and [#150](https://github.com/PicoPlus-devel/pico-infonesPlus/issues/150).
+Boards marked *untested* build and are released, but have not been tried on real hardware. The Spotpear and Murmulator boards also have no setup section in the table above: wire the Spotpear board according to [its own documentation](https://spotpear.com/index/product/detail/id/1207.html), and for the Murmulator boards see [murmulator.ru](https://murmulator.ru/) and [#150](https://github.com/PicoPlus-devel/pico-infonesPlus/issues/150).
 
 > [!WARNING]
 > **Only HSTX boards deliver proper 60 Hz output and universal monitor compatibility; non‑HSTX (PicoDVI) builds set the refresh rate to 77.1 Hz and may be rejected by some displays.**  
@@ -104,7 +106,8 @@ These are the boards it applies to:
 
 For games at full speed you want one of the HSTX boards from the table above: the
 Adafruit Fruit Jam, a Pico 2 or Pimoroni Pico Plus 2 with an Adafruit DVI breakout
-(also on the PicoNES PCB), the Adafruit Metro RP2350 or the Murmulator M2.
+(also on the PicoNES PCB), the Adafruit Metro RP2350, the Murmulator M2 or the Olimex
+RP2040-PICO-PC with a Pico 2.
 
 This is not something that can be tuned away. The board is already clocked as high
 as it will go, so there is nothing left to hand to the emulator.
@@ -135,6 +138,19 @@ Most games are 4 MB or smaller. A few are larger and switch between parts of the
 - **Larger than 8 MB**, the game does not fit in PSRAM. On a board with HSTX video, PSRAM and 16 MB of flash, such as the Adafruit Fruit Jam or a Pimoroni Pico Plus 2 in the `-c2` build, it runs from flash instead, with the part that does not fit there held in PSRAM. The limit is about 15 MB. Boards that use the PicoDVI driver do not support this.
 
 The first time such a game is started, the console asks before it writes the game to flash. Writing takes about a minute, a progress bar shows how far it is, and the console restarts and starts the game when it is done. Do not switch the board off while it is writing. After that the game starts in a few seconds, until another game of that size is started and takes its place. [pico-snesPlus](https://github.com/PicoPlus-devel/pico-snesPlus) uses the same part of the flash for its largest games, so starting one of those replaces it as well.
+
+### Olimex RP2040-PICO-PC
+
+The [Olimex RP2040-PICO-PC](https://www.olimex.com/Products/MicroPython/PICO/RP2040-PICO-PC/) is a carrier board for a Raspberry Pi Pico with an HDMI connector, a microSD card slot, a USB-A port and an audio jack. Fitted with a Raspberry Pi Pico 2, it runs the `-c15` build.
+
+- **Video:** HSTX, 60 Hz, on the HDMI connector.
+- **Sound:** through HDMI and the audio jack at the same time.
+- **Controllers:** USB controllers and a USB keyboard on the USB-A port. A NES or SNES controller can be connected to the UEXT connector: clock on GPIO 5, latch on GPIO 9 and data on GPIO 20. There is no second controller port and no Wii Classic controller support.
+- **PSRAM:** a Pico 2 has none, so a game is written to flash before it starts, see [PSRAM](#psram). The last 260 KB of flash are reserved on this board and never used for games, so the largest game that fits is 260 KB smaller than with a Pico 2 on other boards.
+- **Video Clock Fix:** available in the settings menu, see [Video Clock Fix](#video-clock-fix). With it enabled the USB-A port no longer works for controllers, so a NES or SNES controller on the UEXT connector is needed.
+- **Pico 2 W:** there is no Pico 2 W binary. On a Pico 2 W, GPIO 23, which this build uses to reduce noise on the audio jack, is connected to the wireless chip.
+
+Support for this board was contributed by [DnCraptor](https://github.com/DnCraptor).
 
 ### Other build configurations
 
@@ -268,7 +284,7 @@ Supported controllers:
 - Dual Shock/Dual Sense and PSClassic
 - Xbox style controllers (XInput)
 - Genesis Mini 1 and 2, and the [Retro-Bit 8 button Arcade Pad with USB](https://www.retro-bit.com/controllers/genesis/#usb)
-- NES and SNES controllers on the GPIO port of a PCB or breadboard setup
+- NES and SNES controllers on the GPIO port of a PCB or breadboard setup, or on the UEXT connector of the [Olimex RP2040-PICO-PC](#olimex-rp2040-pico-pc)
 - AliExpress NES and SNES USB controllers
 - Fruit Jam: SNES Classic and Wii Classic Pro controllers over I2C. Connect the controller to an [Adafruit Wii Nunchuck Breakout Adapter](https://www.adafruit.com/product/4836).
 - USB keyboard
@@ -286,13 +302,13 @@ The menus use three buttons, called Button1, Button2 and Button3 throughout this
 
 ### Buttons in a game
 
-Genesis controllers are used as they are. Every other controller is mapped by the position of its buttons: Genesis A, B and C are the left, bottom and right face buttons, and Genesis X, Y and Z are the left shoulder button, the top face button and the right shoulder button.
+Genesis controllers are used as they are. Every other controller is mapped by the position of its buttons: Genesis A, B and C are the right, left and bottom face buttons, and Genesis X, Y and Z are the left shoulder button, the top face button and the right shoulder button. Most games attack with B and jump with C, so these land on the buttons that do the same in most SNES games. ([#40](https://github.com/PicoPlus-devel/pico-genesisPlus/issues/40))
 
 | Genesis | Genesis Mini 2, Retro-Bit Arcade Pad | SNES, Wii Classic | NES | XInput | Dual Shock/Sense | Keyboard |
 | ------- | ------------------------------------ | ----------------- | --- | ------ | ---------------- | -------- |
-| A       | A | Y | Select | X  | Square   | Z |
-| B       | B | B | B      | A  | Cross    | X |
-| C       | C | A | A      | B  | Circle   | C |
+| A       | A | A | Select | B  | Circle   | Z |
+| B       | B | Y | B      | X  | Square   | X |
+| C       | C | B | A      | A  | Cross    | C |
 | X       | X | L | –      | LB | L1       | Q |
 | Y       | Y | X | –      | Y  | Triangle | W |
 | Z       | Z | R | –      | RB | R1       | E |
@@ -319,9 +335,9 @@ Choose **6 button** for a game that supports six buttons without saying so in it
 
 ### NES and SNES pads on the GPIO port
 
-The two sockets speak one protocol but the pads send their buttons in a different order, so the port works out for itself which one is plugged in. A NES pad says so on every read, and anything else is taken for a SNES pad — including a SNES pad behind a home-made adapter cable, which works fully from the first button press with no need to wake it up first. Both then get the mapping from the [table above](#buttons-in-a-game). On a SNES pad on this port SELECT also acts as Genesis C, for the reason below.
+The two sockets speak one protocol but the pads send their buttons in a different order, so the port works out for itself which one is plugged in. A NES pad says so on every read, and anything else is taken for a SNES pad — including a SNES pad behind a home-made adapter cable, which works fully from the first button press with no need to wake it up first. Both then get the mapping from the [table above](#buttons-in-a-game). On a SNES pad on this port SELECT also acts as Genesis A, for the reason below.
 
-One caveat: a NES pad is recognised by grounding the shift register outputs it does not use, which is what an original Nintendo pad does, and most aftermarket ones with it. A clone that leaves them floating cannot be told from a SNES pad. It keeps all three Genesis buttons, but in other places: B is Genesis A, A is Genesis B and SELECT is Genesis C. To check a pad, open **Settings > Controller Test**, press a button and look at the `Sent by pad:` line — a top digit of `F` means the pad identifies itself properly. ([#28](https://github.com/PicoPlus-devel/pico-genesisPlus/issues/28), [#34](https://github.com/PicoPlus-devel/pico-genesisPlus/issues/34))
+A NES pad is recognised by grounding the shift register outputs it does not use, which is what an original Nintendo pad does, and most aftermarket ones with it. A clone that leaves them floating cannot be told from a SNES pad, but it plays the same as any other NES pad: SELECT, B and A are Genesis A, B and C. ([#28](https://github.com/PicoPlus-devel/pico-genesisPlus/issues/28), [#34](https://github.com/PicoPlus-devel/pico-genesisPlus/issues/34))
 
 ## Menu
 
@@ -385,7 +401,7 @@ the board restarts to apply it. It is not offered on the other boards.
 At 378 MHz and higher the HDMI output clock is derived from the CPU clock, and some TVs and monitors then show small dots or short dotted lines in the picture. Taking the HDMI clock from the clock source of the built-in USB port avoids this, but leaves that port without a usable clock.
 
 - On HW_CONFIG 8 (Adafruit Fruit Jam) this is always done. USB controllers are connected to the second USB port on this board, so nothing is lost.
-- On the other boards with HSTX video, HW_CONFIG 2 (Pico 2 or Pimoroni Pico Plus 2 with Adafruit DVI breakout, also on the PicoNES PCB), HW_CONFIG 5 (Adafruit Metro RP2350) and HW_CONFIG 13 (Murmulator M2), the built-in USB port is the only USB port, so this is a setting: **Video Clock Fix**, in the settings menu of the rom browser, below the overclock. It is off by default.
+- On the other boards with HSTX video, HW_CONFIG 2 (Pico 2 or Pimoroni Pico Plus 2 with Adafruit DVI breakout, also on the PicoNES PCB), HW_CONFIG 5 (Adafruit Metro RP2350), HW_CONFIG 13 (Murmulator M2) and HW_CONFIG 15 (Olimex RP2040-PICO-PC, where it is the USB-A port), the built-in USB port is the only USB port, so this is a setting: **Video Clock Fix**, in the settings menu of the rom browser, below the overclock. It is off by default.
 - Boards with PicoDVI video are not affected and do not offer the setting.
 
 > [!IMPORTANT]
@@ -523,7 +539,6 @@ Download the metadata pack from the [releases page](https://github.com/PicoPlus-
 - **Games run slower on PicoDVI boards.** Boards without HSTX cannot keep up with full speed, see [Speed on PicoDVI boards](#speed-on-picodvi-boards).
 - **Mega Drive roms and Sega CD discs only.** Files that are neither are refused with a message instead of starting the emulator on whatever the file happens to contain.
 - **Sega CD games run too slow.** Some games run, others still have bugs and graphical artifacts. Most are too slow to be playable. MD+ games are not affected. Disc images need a board with HSTX video and PSRAM, and only `.cue`/`.bin` images are supported, not `.chd`. There is no support for the backup RAM cartridge or for CD+G.
-- **A NES pad clone on the GPIO port may get a different button layout.** The port tells NES and SNES pads apart by the shift register outputs a NES pad does not use, which an original Nintendo pad grounds. A clone that leaves them floating is taken for a SNES pad: all three Genesis buttons still work, but B is Genesis A, A is Genesis B and SELECT is Genesis C. See [NES and SNES pads on the GPIO port](#nes-and-snes-pads-on-the-gpio-port). ([#28](https://github.com/PicoPlus-devel/pico-genesisPlus/issues/28))
 
 ## For developers
 
@@ -634,6 +649,7 @@ Gwenesis is itself built out of other people's work:
 
 - The **PicoNES PCB** was designed by **John Edgar Park** ([@johnedgarpark](https://twitter.com/johnedgarpark)).
 - The **PicoNES Mini** and **PicoNES Micro** PCBs, and the 3D-printed cases for all of them, were designed by **Gavin Knight** ([DynaMight1124](https://github.com/DynaMight1124)).
+- Support for the **Olimex RP2040-PICO-PC**, including sound through its audio jack, was contributed by [DnCraptor](https://github.com/DnCraptor) ([pico_shared #100](https://github.com/PicoPlus-devel/pico_shared/pull/100)).
 
 ### AI assistance
 
