@@ -21,6 +21,10 @@
 #include "crc32.h"
 #if PICO_RP2350 && PSRAM_CS_PIN
 #include "PicoPlusPsram.h"
+
+#ifndef FLASH_RESERVED_TOP
+#define FLASH_RESERVED_TOP 0   /* set by BoardConfigs.cmake; 0 = no reserve */
+#endif
 #endif
 
 /* Region: the top 8 MB of the board's 16 MB flash. Clear of the standalone
@@ -84,6 +88,16 @@ static bool region_present(void)
         printf("romflash: flash is %u MB, need %u MB for the ROM region\n",
                (unsigned)(capacity / (1024 * 1024)),
                (unsigned)(need / (1024 * 1024)));
+        return false;
+    }
+    /* The region is the top 8 MB of the chip, so on a board that keeps a
+     * reserve at the end of flash (pico-launcher: FLASH_RESERVED_TOP = 260 KB,
+     * ERASE block at 16M-260K, launcher image at 16M-256K) it would overwrite
+     * that reserve. Refuse the region there; the caller then reports
+     * "ROM too large" instead of writing over the launcher. */
+    if (need > capacity - (uint32_t)FLASH_RESERVED_TOP) {
+        printf("romflash: region would reach into the %u KB reserved at the end of flash\n",
+               (unsigned)(FLASH_RESERVED_TOP / 1024));
         return false;
     }
     /* Belt and braces: never let the region collide with the linked image or
