@@ -1,3 +1,17 @@
+# ====================================================================================
+# Target platform. This must be decided BEFORE the Pico SDK is loaded: the SDK's
+# pre-load files pick PICO_PLATFORM and the compiler (cortex-m0plus for rp2040,
+# cortex-m33 for rp2350-arm-s) at that point, and a later set() is ignored for the
+# compiler. Without this, an rp2350 platform is combined with the Cortex-M0+ toolchain
+# and spin_lock.h fails with "no SW_SPIN_LOCK_LOCK available". HW_CONFIG 16 is the
+# Waveshare RP2350-PiZero (RP2350 only); bld.sh passes -DPICO_PLATFORM=rp2350-arm-s for it.
+if (NOT HW_CONFIG)
+    set(HW_CONFIG 16 CACHE STRING "Select the hardware configuration for your board")
+endif()
+if (HW_CONFIG EQUAL 16)
+    set(PICO_PLATFORM rp2350-arm-s)
+endif()
+# ====================================================================================
 # == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
 if(WIN32)
     set(USERHOME $ENV{USERPROFILE})
@@ -12,6 +26,15 @@ if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
 # ====================================================================================
+# Use the Pico SDK version this project is written for (sdkVersion above), from the
+# standard per-user location, instead of whatever PICO_SDK_PATH happens to point to.
+# An older SDK (1.x) ships a pioasm that rejects the .pio_version directive used by
+# pico_shared. Set PICO_SDK_PATH only if the version folder is not installed.
+set(repoSdkDir ${USERHOME}/.pico-sdk/sdk/${sdkVersion})
+if (EXISTS ${repoSdkDir}/src/CMakeLists.txt)
+    set(ENV{PICO_SDK_PATH} ${repoSdkDir})
+    message("Pico SDK ${sdkVersion}: ${repoSdkDir}")
+endif()
 cmake_minimum_required(VERSION 3.13)
 set(projectname picogenesisPlus)
 #set(PICO_DEOPTIMIZED_DEBUG on)
@@ -63,6 +86,11 @@ if(ENABLE_PIO_USB EQUAL 0 AND TARGET tinyusb_common_base)
     endif()
 endif()
 project(${projectname} C CXX ASM)
+# Fail early with a clear message if the toolchain does not match the platform.
+if (HW_CONFIG EQUAL 16 AND NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "cortex-m33")
+    message(FATAL_ERROR "HW_CONFIG 16 needs PICO_PLATFORM=rp2350-arm-s and the Cortex-M33 toolchain, "
+            "but CMAKE_SYSTEM_PROCESSOR is '${CMAKE_SYSTEM_PROCESSOR}'. Delete the build directory and reconfigure.")
+endif()
 pico_sdk_init()
 # check_and_add_pico_pio_usb_support() needs pico_generate_pio_header which is
 # only available after pico_sdk_init().  The first call inside family.cmake
