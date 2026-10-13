@@ -130,7 +130,15 @@ static uint16_t wiipad_raw_cached = 0;
  * higher core clocks because we lack a suitable integer divisor chain for the pixel clock.
  * See: https://github.com/Wren6991/PicoDVI/issues/56
  */
+/* HW_CONFIG 16 (Waveshare RP2350-PiZero, z0p2) runs PicoDVI at 252 MHz: the
+ * board profile in pico_shared/BoardConfigs.cmake says the PiZero does not hold
+ * a higher clock with HDMI, and the z0p2 builds that work on this board (pico-pce,
+ * G&W) use 252 MHz. The 324 MHz default is left for the other boards. */
+#if HW_CONFIG == 16
+#define EMULATOR_CLOCKFREQ_KHZ 252000
+#else
 #define EMULATOR_CLOCKFREQ_KHZ 324000 // Overclock frequency in kHz when using Emulator
+#endif
 #define VOLTAGE VREG_VOLTAGE_1_30
 #else
 /* HSTX overclock notes:
