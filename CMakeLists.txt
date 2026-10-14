@@ -4,11 +4,13 @@
 # cortex-m33 for rp2350-arm-s) at that point, and a later set() is ignored for the
 # compiler. Without this, an rp2350 platform is combined with the Cortex-M0+ toolchain
 # and spin_lock.h fails with "no SW_SPIN_LOCK_LOCK available". HW_CONFIG 16 is the
-# Waveshare RP2350-PiZero (RP2350 only); bld.sh passes -DPICO_PLATFORM=rp2350-arm-s for it.
+# Waveshare RP2350-PiZero, 13 the Murmulator M2 (m2p2) and 15 the Olimex PICO-PC
+# (RP2350 only); bld.sh passes -DPICO_PLATFORM=rp2350-arm-s for them.
+# Default: Murmulator M2 (m2p2); M2_AUDIO=I2S or PWM (pico_shared/BoardConfigs.cmake).
 if (NOT HW_CONFIG)
-    set(HW_CONFIG 16 CACHE STRING "Select the hardware configuration for your board")
+    set(HW_CONFIG 13 CACHE STRING "Select the hardware configuration for your board")
 endif()
-if (HW_CONFIG EQUAL 16)
+if (HW_CONFIG EQUAL 13 OR HW_CONFIG EQUAL 15 OR HW_CONFIG EQUAL 16)
     set(PICO_PLATFORM rp2350-arm-s)
 endif()
 # ====================================================================================
@@ -50,7 +52,7 @@ ENDIF(NOT CMAKE_BUILD_TYPE)
 message("* Current build type is : ${CMAKE_BUILD_TYPE}")
 
 if (NOT HW_CONFIG)
-    set(HW_CONFIG 16 CACHE STRING "Select the hardware configuration for your board")      
+    set(HW_CONFIG 13 CACHE STRING "Select the hardware configuration for your board")
 endif()
 if (NOT USE_HSTX)
     set(USE_HSTX 1 CACHE STRING "Use HSTX for display output when possible")
@@ -87,8 +89,8 @@ if(ENABLE_PIO_USB EQUAL 0 AND TARGET tinyusb_common_base)
 endif()
 project(${projectname} C CXX ASM)
 # Fail early with a clear message if the toolchain does not match the platform.
-if (HW_CONFIG EQUAL 16 AND NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "cortex-m33")
-    message(FATAL_ERROR "HW_CONFIG 16 needs PICO_PLATFORM=rp2350-arm-s and the Cortex-M33 toolchain, "
+if ((HW_CONFIG EQUAL 13 OR HW_CONFIG EQUAL 15 OR HW_CONFIG EQUAL 16) AND NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "cortex-m33")
+    message(FATAL_ERROR "HW_CONFIG ${HW_CONFIG} needs PICO_PLATFORM=rp2350-arm-s and the Cortex-M33 toolchain, "
             "but CMAKE_SYSTEM_PROCESSOR is '${CMAKE_SYSTEM_PROCESSOR}'. Delete the build directory and reconfigure.")
 endif()
 pico_sdk_init()
