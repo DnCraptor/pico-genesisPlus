@@ -14,6 +14,7 @@
 #include "nespad.h"
 #include "wiipad.h"
 #include "FrensHelpers.h"
+#include "pwm_audio.h"
 #include "settings.h"
 #include "FrensFonts.h"
 #include "vumeter.h"
@@ -994,6 +995,11 @@ static void bridgeVUOnly(int16_t l, int16_t r)
 #else
 static void audioOutDVI(int16_t l, int16_t r)
 {
+    /* PWM audio jack (Murmulator M1 with M1_AUDIO=PWM): on HSTX builds
+       hstx_push_audio_sample() feeds it, PicoDVI builds have to do it here.
+       Before the HDMI ring check: pwm_audio paces itself, so a sample HDMI
+       has no room for still belongs to the jack. No-op without a PWM jack. */
+    pwm_audio_push(l, r);
     auto &ring = dvi_->getAudioRingBuffer();
     if (ring.getWritableSize() < 1)
     {

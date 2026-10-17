@@ -8,7 +8,7 @@
 # (RP2350 only) and 12 the Murmulator M1 - built here only with an RP2350 module
 # (m1p2); bld.sh passes -DPICO_PLATFORM=rp2350-arm-s for them.
 # Default: Murmulator M1 (m1p2); M1_AUDIO=I2S or PWM, for m2p2 HW_CONFIG 13 with
-# M2_AUDIO=I2S or PWM (pico_shared/BoardConfigs.cmake).
+# M2_AUDIO=I2S or PWM (pico_shared/BoardConfigs.cmake); set below.
 if (NOT HW_CONFIG)
     set(HW_CONFIG 12 CACHE STRING "Select the hardware configuration for your board")
 endif()
@@ -29,8 +29,13 @@ set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
-set(M2_AUDIO PWM)
-set(M1_AUDIO I2S)
+# Sound output (I2S or PWM), one firmware per choice. A plain set() does not work
+# here: with cmake_minimum_required(VERSION 3.13) policy CMP0126 is OLD, and the
+# set(... CACHE) in pico_shared/BoardConfigs.cmake removes the normal variable on
+# a fresh configure, so its I2S default wins. CACHE ... FORCE always applies; it
+# also overrides -DM1_AUDIO=/-DM2_AUDIO= given on the command line.
+set(M1_AUDIO PWM CACHE STRING "Murmulator M1 sound output: I2S (TDA1387 DAC) or PWM" FORCE)
+set(M2_AUDIO PWM CACHE STRING "Murmulator M2 sound output: I2S (TDA1387 DAC) or PWM" FORCE)
 # ====================================================================================
 # Use the Pico SDK version this project is written for (sdkVersion above), from the
 # standard per-user location, instead of whatever PICO_SDK_PATH happens to point to.
